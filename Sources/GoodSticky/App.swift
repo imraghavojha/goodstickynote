@@ -1,0 +1,311 @@
+import AppKit
+import Carbon.HIToolbox
+
+final class HotKeyManager {
+    private var hotKey: EventHotKeyRef?
+    private var handler: EventHandlerRef?
+    private var localMonitor: Any?
+    private var currentPreferences: Preferences?
+    private var suspended = false
+    private(set) var isRegistered = false
+    init() {
+        var eventType = EventTypeSpec(eventClass: OSType(kEventClassKeyboard), eventKind: UInt32(kEventHotKeyPressed))
+        InstallEventHandler(GetApplicationEventTarget(), { _, _, _ in
+            DispatchQueue.main.async { AppDelegate.shared.createNote() }
+            return noErr
+        }, 1, &eventType, nil, &handler)
+        // App-local events also cover nonactivating panels and direct accessibility input.
+        // Carbon consumes matching physical global events before they reach this monitor.
+        localMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] event in
+            guard let self, !self.suspended, let preferences = self.currentPreferences,
+                  UInt32(event.keyCode) == preferences.keyCode,
+                  Self.carbonFlags(event.modifierFlags) == preferences.modifiers else { return event }
+            if !event.isARepeat { DispatchQueue.main.async { AppDelegate.shared.createNote() } }
+            return nil
+        }
+    }
+    func suspend() {
+        suspended = true
+        if let hotKey { UnregisterEventHotKey(hotKey); self.hotKey = nil }
+    }
+    @discardableResult func register(_ preferences: Preferences) -> Bool {
+        if let hotKey { UnregisterEventHotKey(hotKey); self.hotKey = nil }
+        currentPreferences = preferences; suspended = false
+        let id = EventHotKeyID(signature: OSType(0x4753544B), id: 1)
+        isRegistered = RegisterEventHotKey(preferences.keyCode, preferences.modifiers, id, GetApplicationEventTarget(), 0, &hotKey) == noErr
+        return isRegistered
+    }
+    static func carbonFlags(_ flags: NSEvent.ModifierFlags) -> UInt32 {
+        var result: UInt32 = 0
+        if flags.contains(.control) { result |= UInt32(controlKey) }
+        if flags.contains(.option) { result |= UInt32(optionKey) }
+        if flags.contains(.command) { result |= UInt32(cmdKey) }
+        if flags.contains(.shift) { result |= UInt32(shiftKey) }
+        return result
+    }
+    static func display(_ preferences: Preferences) -> String {
+        var prefix = ""
+        if preferences.modifiers & UInt32(controlKey) != 0 { prefix += "⌃" }
+        if preferences.modifiers & UInt32(optionKey) != 0 { prefix += "⌥" }
+        if preferences.modifiers & UInt32(shiftKey) != 0 { prefix += "⇧" }
+        if preferences.modifiers & UInt32(cmdKey) != 0 { prefix += "⌘" }
+        let keys: [UInt32: String] = [0:"A",1:"S",2:"D",3:"F",4:"H",5:"G",6:"Z",7:"X",8:"C",9:"V",11:"B",12:"Q",13:"W",14:"E",15:"R",16:"Y",17:"T",18:"1",19:"2",20:"3",21:"4",22:"6",23:"5",24:"=",25:"9",26:"7",27:"−",28:"8",29:"0",30:"]",31:"O",32:"U",33:"[",34:"I",35:"P",36:"↩",37:"L",38:"J",39:"'",40:"K",41:";",42:"\\",43:",",44:"/",45:"N",46:"M",47:".",48:"⇥",49:"Space",50:"`",51:"⌫",123:"←",124:"→",125:"↓",126:"↑"]
+        return prefix + "  " + (keys[preferences.keyCode] ?? "Key \(preferences.keyCode)")
+    }
+}
+
+final class AppDelegate: NSObject, NSApplicationDelegate {
+    static var shared: AppDelegate!
+    let store = NoteStore.shared
+    let hotKey = HotKeyManager()
+    var statusItem: NSStatusItem!
+    var library: LibraryController?
+    var preferences: PreferencesController?
+    var widgets: [String: WidgetController] = [:]
+    private var refreshing = false
+    private var waitingToQuit = false
+    private var outsideClickMonitor: Any?
+
+    func applicationDidFinishLaunching(_ notification: Notification) {
+        AppDelegate.shared = self
+        NSApp.setActivationPolicy(.accessory)
+        buildMainMenu()
+        outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            self?.returnNotesToDesktop()
+        }
+        statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
+        statusItem.button?.image = NSImage(systemSymbolName: "note.text", accessibilityDescription: "GoodSticky")
+        statusItem.button?.toolTip = "GoodSticky — your desktop notes"
+        let menu = NSMenu()
+        let new = ClosureMenuItem("New note") { [weak self] in self?.createNote() }; new.keyEquivalent = "n"; menu.addItem(new)
+        menu.addItem(ClosureMenuItem("Notes…") { [weak self] in self?.showLibrary() })
+        menu.addItem(.separator())
+        menu.addItem(ClosureMenuItem("Bring notes forward") { [weak self] in self?.bringAllForward() })
+        menu.addItem(ClosureMenuItem("Show all notes") { [weak self] in
+            guard let self else { return }
+            self.store.updateMany(self.store.notes.map(\.id)) { $0.hidden = false }
+        })
+        menu.addItem(ClosureMenuItem("Hide all notes") { [weak self] in
+            guard let self else { return }
+            self.store.updateMany(self.store.notes.map(\.id)) { $0.hidden = true }
+        })
+        menu.addItem(.separator())
+        menu.addItem(ClosureMenuItem("Preferences…") { [weak self] in self?.showPreferences() })
+        menu.addItem(.separator())
+        let quit = ClosureMenuItem("Quit GoodSticky") { NSApp.terminate(nil) }; quit.keyEquivalent = "q"; menu.addItem(quit)
+        statusItem.menu = menu
+        store.onImportsFinished = { [weak self] in
+            guard let self, self.waitingToQuit else { return }
+            self.waitingToQuit = false
+            NSApp.reply(toApplicationShouldTerminate: self.saveBeforeQuit())
+        }
+        store.onError = { message in
+            let alert = NSAlert(); alert.messageText = "Your notes need attention"; alert.informativeText = message; alert.runModal()
+        }
+        if !hotKey.register(store.preferences) { NSLog("GoodSticky: global shortcut unavailable") }
+        let firstLaunch = !FileManager.default.fileExists(atPath: store.directory.appendingPathComponent("notes.json").path) && !store.loadFailed
+        if firstLaunch { seedWelcomeNotes() }
+        store.onChange = { [weak self] in self?.synchronize() }
+        synchronize()
+        if firstLaunch || store.loadFailed || CommandLine.arguments.contains("--smoke-test") || CommandLine.arguments.contains("--show-library") { showLibrary() }
+        if store.loadFailed {
+            let alert = NSAlert(); alert.messageText = "Your library couldn’t be opened"; alert.informativeText = "Your original notes have been left untouched at \(store.directory.path). Quit GoodSticky and restore notes.json from a backup before adding notes."; alert.runModal()
+        }
+        if CommandLine.arguments.contains("--smoke-test") {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.runSmokeTest() }
+        }
+    }
+    func buildMainMenu() {
+        let main = NSMenu()
+        let appItem = NSMenuItem(); let appMenu = NSMenu()
+        appMenu.addItem(ClosureMenuItem("About GoodSticky") {
+            NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "GoodSticky", .applicationVersion: "0.1.0"])
+        })
+        let settings = ClosureMenuItem("Preferences…") { self.showPreferences() }; settings.keyEquivalent = ","; appMenu.addItem(settings)
+        appMenu.addItem(.separator())
+        let quit = ClosureMenuItem("Quit GoodSticky") { NSApp.terminate(nil) }; quit.keyEquivalent = "q"; appMenu.addItem(quit)
+        appItem.submenu = appMenu; main.addItem(appItem)
+        let fileItem = NSMenuItem(); let fileMenu = NSMenu(title: "File")
+        let new = ClosureMenuItem("New note") { self.createNote() }; new.keyEquivalent = "n"; fileMenu.addItem(new)
+        let close = NSMenuItem(title: "Close", action: #selector(NSWindow.performClose(_:)), keyEquivalent: "w"); fileMenu.addItem(close)
+        fileItem.submenu = fileMenu; main.addItem(fileItem)
+        let editItem = NSMenuItem(); let editMenu = NSMenu(title: "Edit")
+        for (title, action, key) in [("Undo", Selector(("undo:")), "z"), ("Cut", #selector(NSText.cut(_:)), "x"), ("Copy", #selector(NSText.copy(_:)), "c"), ("Paste", #selector(NSText.paste(_:)), "v"), ("Select All", #selector(NSText.selectAll(_:)), "a")] {
+            editMenu.addItem(NSMenuItem(title: title, action: action, keyEquivalent: key))
+        }
+        editItem.submenu = editMenu; main.addItem(editItem)
+        NSApp.mainMenu = main
+    }
+    func seedWelcomeNotes() {
+        let first = store.add(text: "Hello, desktop.\n\nA little space for a thought you’d like to keep close.\n\nClick here and make it yours.", theme: "butter")
+        let second = store.add(text: "Less in your head.\n\nHover for copy & hide.\nDrag the top edge to move me.\nResize from any edge.\n\nYour notes stay on this Mac.", theme: "sage")
+        let third = store.add(text: "Room for more.\n\nDrop a picture or file here.\nTry a new paper color.\nStack notes from the ••• menu.\n\n⌃⌥N makes a fresh note.", theme: "lilac")
+        if let screen = NSScreen.main {
+            let frame = screen.visibleFrame
+            for (index, id) in [first.id, second.id, third.id].enumerated() {
+                store.update(id, notify: false) { $0.x = frame.minX + 50 + CGFloat(index) * 335; $0.y = frame.maxY - 370 }
+            }
+        }
+    }
+    func synchronize() {
+        guard !refreshing else { return }; refreshing = true
+        defer { refreshing = false }
+        let groups = Dictionary(grouping: store.notes.filter { !$0.hidden }) { $0.stackID?.uuidString ?? $0.id.uuidString }
+        for key in Array(widgets.keys) where groups[key] == nil { widgets.removeValue(forKey: key)?.close() }
+        for (key, notes) in groups {
+            let ids = notes.map(\.id)
+            if let existing = widgets[key], existing.ids == ids { existing.refresh() }
+            else {
+                widgets.removeValue(forKey: key)?.close()
+                let widget = WidgetController(ids: ids); widgets[key] = widget; widget.show()
+            }
+        }
+        if library?.window?.isVisible == true { library?.refresh() }
+    }
+    func createNote() {
+        guard !store.loadFailed else { return }
+        let note = store.add()
+        widgets[note.id.uuidString]?.show(focus: true)
+    }
+    func reveal(_ id: UUID) {
+        guard let note = store.note(id) else { return }
+        store.update(id) { $0.hidden = false }
+        let key = note.stackID?.uuidString ?? id.uuidString
+        if let widget = widgets[key] { widget.activeID = id; widget.refresh(); widget.show(focus: true) }
+    }
+    func bringAllForward() {
+        for widget in widgets.values { widget.bringForward() }
+    }
+    func returnNotesToDesktop() {
+        for widget in widgets.values { widget.returnToDesktop() }
+    }
+    func showLibrary() { returnNotesToDesktop(); if library == nil { library = LibraryController() }; library?.present() }
+    func showPreferences() {
+        returnNotesToDesktop()
+        if preferences == nil { preferences = PreferencesController() }
+        preferences?.window?.makeKeyAndOrderFront(nil); NSApp.activate(ignoringOtherApps: true)
+    }
+    func stack(_ id: UUID, with otherID: UUID) {
+        guard let note = store.note(id), let other = store.note(otherID) else { return }
+        let stackID = other.stackID ?? UUID()
+        let ids = store.notes.filter { $0.id == id || $0.id == otherID || (note.stackID != nil && $0.stackID == note.stackID) || (other.stackID != nil && $0.stackID == other.stackID) }.map(\.id)
+        store.updateMany(ids, notify: false) { $0.stackID = stackID; $0.x = other.x; $0.y = other.y; $0.width = other.width; $0.height = other.height; $0.pinned = other.pinned }
+        synchronize(); widgets[stackID.uuidString]?.show(focus: true)
+    }
+    func setPinned(_ id: UUID, pinned: Bool) {
+        guard let note = store.note(id) else { return }
+        let ids = store.notes.filter { $0.id == id || (note.stackID != nil && $0.stackID == note.stackID) }.map(\.id)
+        store.updateMany(ids) { $0.pinned = pinned }
+    }
+    func unstack(_ id: UUID) {
+        guard let note = store.note(id) else { return }
+        store.update(id, notify: false) { $0.stackID = nil; $0.x += 24; $0.y -= 24 }
+        if let stack = note.stackID {
+            let remaining = store.notes.filter { $0.stackID == stack }
+            if remaining.count == 1 { store.update(remaining[0].id, notify: false) { $0.stackID = nil } }
+        }
+        synchronize(); widgets[id.uuidString]?.show(focus: true)
+    }
+    func confirmDelete(_ id: UUID) {
+        guard let note = store.note(id) else { return }
+        let alert = NSAlert(); alert.messageText = "Delete “\(String(note.title.prefix(45)))”?"
+        alert.informativeText = "This permanently removes the note and its local attachments. You can hide a note to keep it for later."
+        alert.addButton(withTitle: "Keep note"); alert.addButton(withTitle: "Delete")
+        if alert.runModal() == .alertSecondButtonReturn { store.delete(id) }
+    }
+    func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showLibrary(); return true }
+    func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        if store.pendingImports > 0 { waitingToQuit = true; return .terminateLater }
+        return saveBeforeQuit() ? .terminateNow : .terminateCancel
+    }
+    func saveBeforeQuit() -> Bool {
+        do { try store.flush(); return true }
+        catch {
+            let alert = NSAlert()
+            alert.messageText = "Couldn’t save notes"
+            alert.informativeText = "Your changes are still open. Check the disk space and permissions for \(store.directory.path), then try quitting again.\n\n\(error.localizedDescription)"
+            alert.addButton(withTitle: "Keep open")
+            NSApp.activate(ignoringOtherApps: true)
+            alert.runModal()
+            return false
+        }
+    }
+    func applicationDidResignActive(_ notification: Notification) { returnNotesToDesktop() }
+    func applicationWillTerminate(_ notification: Notification) {
+        if CommandLine.arguments.contains("--smoke-test") { try? FileManager.default.removeItem(at: store.directory) }
+    }
+    func runSmokeTest() {
+        let savedCount = store.notes.count
+        if let index = CommandLine.arguments.firstIndex(of: "--snapshot-dir"), CommandLine.arguments.count > index + 1 {
+            let directory = URL(fileURLWithPath: CommandLine.arguments[index + 1])
+            try? FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+            func capture(_ view: NSView?, _ name: String) {
+                guard let view else { return }
+                view.layoutSubtreeIfNeeded()
+                guard let bitmap = view.bitmapImageRepForCachingDisplay(in: view.bounds) else { return }
+                view.cacheDisplay(in: view.bounds, to: bitmap)
+                try? bitmap.representation(using: .png, properties: [:])?.write(to: directory.appendingPathComponent(name + ".png"))
+            }
+            library?.window?.contentView?.layoutSubtreeIfNeeded()
+            library?.layoutCards()
+            capture(library?.window?.contentView, "library")
+            capture(widgets.values.first?.surface, "widget")
+            if preferences == nil { preferences = PreferencesController() }
+            capture(preferences?.window?.contentView, "preferences")
+        }
+        let first = store.add(text: "Smoke test\nRound-trip", theme: "sky")
+        let second = store.add(text: "Second smoke note", theme: "rose")
+        store.update(first.id) { $0.opacity = 0.65 }
+        stack(first.id, with: second.id)
+        let stackID = store.note(first.id)!.stackID!
+        let stacked = widgets[stackID.uuidString]?.ids.count == 2
+        let image = NSImage(size: NSSize(width: 16, height: 16))
+        image.lockFocus(); NSColor.systemBlue.setFill(); NSBezierPath(rect: NSRect(x: 0, y: 0, width: 16, height: 16)).fill(); image.unlockFocus()
+        let picture = Attachment(name: "layout.png", storedName: "layout.png")
+        let file = Attachment(name: "layout.txt", storedName: "layout.txt")
+        do {
+            let bitmap = NSBitmapImageRep(data: image.tiffRepresentation!)!
+            try bitmap.representation(using: .png, properties: [:])!.write(to: store.attachmentURL(picture))
+            try Data("layout".utf8).write(to: store.attachmentURL(file))
+        } catch { preconditionFailure("Fixture creation failed: \(error)") }
+        store.update(first.id) { $0.attachments = [picture, file] }
+        let stackWidget = widgets[stackID.uuidString]!
+        stackWidget.window?.setContentSize(NSSize(width: 260, height: 230))
+        stackWidget.surface.layoutSubtreeIfNeeded()
+        let minimumLayout = stackWidget.scroll.frame.height >= 40 && stackWidget.attachments.frame.height <= 60 && stackWidget.tabs.frame.height == 26
+        setPinned(first.id, pinned: true)
+        let sharedPin = store.note(second.id)?.pinned == true
+        let tabsAccessible = stackWidget.tabs.arrangedSubviews.allSatisfy {
+            $0.accessibilityRole() == .radioButton && !($0.accessibilityLabel() ?? "").isEmpty
+        }
+        if let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .control, timestamp: 0, windowNumber: stackWidget.window!.windowNumber, context: nil, characters: "\t", charactersIgnoringModifiers: "\t", isARepeat: false, keyCode: 48) {
+            stackWidget.textView.keyDown(with: event)
+        }
+        let keyboardCycle = stackWidget.activeID == second.id
+        stackWidget.activeID = first.id; stackWidget.refresh()
+        library?.refresh()
+        let card = library?.grid.subviews.compactMap { $0 as? NoteCard }.first { $0.note != nil }
+        let cardFocused = card.map { library?.window?.makeFirstResponder($0) == true } ?? false
+        let focusedControls = card?.subviews.compactMap { $0 as? NSButton }.filter { $0.toolTip == "Copy note" }.allSatisfy { !$0.isHidden } == true
+
+        setPinned(first.id, pinned: false)
+        bringAllForward()
+        // Focusing another widget must not lower previously raised notes.
+        for widget in widgets.values { widget.window?.makeKeyAndOrderFront(nil) }
+        let allRaised = widgets.values.allSatisfy { $0.window?.level == .floating }
+        returnNotesToDesktop()
+
+        store.update(first.id) { $0.hidden = true }
+        let hidden = widgets[stackID.uuidString]?.ids.count == 1
+        reveal(first.id)
+        let restored = widgets[stackID.uuidString]?.ids.count == 2
+        store.update(first.id) { $0.stackID = nil }
+        let unstacked = widgets[first.id.uuidString] != nil
+        store.delete(first.id); store.delete(second.id)
+        do { try store.flush() } catch { preconditionFailure("Smoke save failed: \(error)") }
+        print("SMOKE TEST: stacked=\(stacked) hidden=\(hidden) restored=\(restored) unstacked=\(unstacked) minimumLayout=\(minimumLayout) sharedPin=\(sharedPin) allRaised=\(allRaised) tabsAccessible=\(tabsAccessible) keyboardCycle=\(keyboardCycle) focusedControls=\(cardFocused && focusedControls) cleanup=\(store.notes.count == savedCount)")
+        precondition(stacked && hidden && restored && unstacked && minimumLayout && sharedPin && allRaised && tabsAccessible && keyboardCycle && cardFocused && focusedControls && store.notes.count == savedCount, "Widget lifecycle smoke test failed")
+        NSApp.terminate(nil)
+    }
+}
