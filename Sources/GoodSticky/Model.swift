@@ -30,8 +30,8 @@ struct StickyNote: Codable, Identifiable, Equatable {
     var opacity = 1.0
     var x: Double = 180
     var y: Double = 240
-    var width: Double = 310
-    var height: Double = 320
+    var width: Double = 220
+    var height: Double = 180
     var hidden = false
     var pinned = false
     var stackID: UUID? = nil
@@ -49,6 +49,7 @@ struct Preferences: Codable {
     var modifiers: UInt32 = 0x1000 | 0x0800 // control + option (Carbon)
     var defaultTheme = "butter"
     var defaultOpacity = 1.0
+    var desktopLayoutVersion: Int? = nil
 }
 
 struct SavedState: Codable {
@@ -125,8 +126,8 @@ final class NoteStore {
         if let screen = NSScreen.screens.first(where: { $0.frame.contains(NSEvent.mouseLocation) }) ?? NSScreen.main {
             let frame = screen.visibleFrame
             let offset = CGFloat(notes.filter { !$0.hidden }.count % 6) * 24
-            note.x = frame.midX - 155 + offset
-            note.y = frame.midY - 160 - offset
+            note.x = frame.midX - 110 + offset
+            note.y = frame.midY - 90 - offset
         }
         notes.append(note)
         save()
