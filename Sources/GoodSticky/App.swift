@@ -67,11 +67,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var waitingToQuit = false
     private var outsideClickMonitor: Any?
     private var statusMenu: NSMenu?
+    private var quitProgress: ImportWaitController?
+    private var replyToTermination: (Bool) -> Void = { NSApp.reply(toApplicationShouldTerminate: $0) }
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
         NSApp.setActivationPolicy(.accessory)
         buildMainMenu()
+        DistributedNotificationCenter.default().addObserver(self, selector: #selector(showNotesRequested), name: Notification.Name("app.goodsticky.showNotes"), object: store.directory.path)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "note.text", accessibilityDescription: "GoodSticky")
         statusItem.button?.toolTip = "GoodSticky — your desktop notes"
@@ -99,14 +102,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.onImportsFinished = { [weak self] in
             guard let self, self.waitingToQuit else { return }
             self.waitingToQuit = false
-            NSApp.reply(toApplicationShouldTerminate: self.saveBeforeQuit())
+            self.quitProgress?.close(); self.quitProgress = nil
+            self.replyToTermination(self.saveBeforeQuit())
         }
         store.onError = { message in
             let alert = NSAlert(); alert.messageText = "Your notes need attention"; alert.informativeText = message; alert.runModal()
         }
         if CommandLine.arguments.contains("--enable-login") {
             do {
-                if SMAppService.mainApp.status != .enabled { try SMAppService.mainApp.register() }
+                if SMAppService.mainApp.status == .enabled || SMAppService.mainApp.status == .requiresApproval { try SMAppService.mainApp.unregister() }
+                try SMAppService.mainApp.register()
                 if SMAppService.mainApp.status == .requiresApproval { SMAppService.openSystemSettingsLoginItems() }
             } catch { store.onError?("Couldn’t enable Open at login: \(error.localizedDescription)") }
         }
@@ -130,6 +135,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.runSmokeTest() }
         }
     }
+    @objc func showNotesRequested() { showLibrary() }
     @objc func statusClicked(_ sender: NSStatusBarButton) {
         if NSApp.currentEvent?.type == .rightMouseUp || NSApp.currentEvent?.modifierFlags.contains(.option) == true {
             statusMenu?.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.minY), in: sender)
@@ -171,15 +177,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard !refreshing else { return }; refreshing = true
         defer { refreshing = false }
         let groups = Dictionary(grouping: store.notes.filter { !$0.hidden }) { $0.stackID?.uuidString ?? $0.id.uuidString }
-        for key in Array(widgets.keys) where groups[key] == nil { widgets.removeValue(forKey: key)?.close() }
-        for (key, notes) in groups {
+        var available = widgets
+        var next: [String: WidgetController] = [:]
+        let activeOwners = Dictionary(widgets.map { ($0.value.activeID, $0.key) }, uniquingKeysWith: { first, _ in first })
+        let activeIDs = Set(activeOwners.keys)
+        let ordered = groups.sorted { lhs, rhs in
+            let left = Set(lhs.value.map(\.id)), right = Set(rhs.value.map(\.id))
+            let leftOwnsActive = !left.isDisjoint(with: activeIDs)
+            let rightOwnsActive = !right.isDisjoint(with: activeIDs)
+            return leftOwnsActive != rightOwnsActive ? leftOwnsActive : lhs.key < rhs.key
+        }
+        for (key, notes) in ordered {
             let ids = notes.map(\.id)
-            if let existing = widgets[key], existing.ids == ids { existing.refresh() }
-            else {
-                widgets.removeValue(forKey: key)?.close()
-                let widget = WidgetController(ids: ids); widgets[key] = widget; widget.show()
+            let reusableKey = available[key] != nil ? key : ids.compactMap { activeOwners[$0] }.first(where: { available[$0] != nil })
+            if let reusableKey, let existing = available.removeValue(forKey: reusableKey) {
+                if existing.ids != ids { existing.updateMembers(ids) }
+                existing.refresh(using: notes.first { $0.id == existing.activeID }); next[key] = existing
+            } else {
+                let widget = WidgetController(ids: ids); next[key] = widget; widget.show()
             }
         }
+        widgets = next
+        for obsolete in available.values { obsolete.close() }
         if library?.window?.isVisible == true { library?.refresh() }
     }
     func closeFrontmost() {
@@ -220,7 +239,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let stackID = other.stackID ?? UUID()
         let ids = store.notes.filter { $0.id == id || $0.id == otherID || (note.stackID != nil && $0.stackID == note.stackID) || (other.stackID != nil && $0.stackID == other.stackID) }.map(\.id)
         store.updateMany(ids, notify: false) { $0.stackID = stackID; $0.x = other.x; $0.y = other.y; $0.width = other.width; $0.height = other.height; $0.pinned = other.pinned }
-        synchronize(); widgets[stackID.uuidString]?.show(focus: true)
+        synchronize()
+        widgets[stackID.uuidString]?.activeID = id; widgets[stackID.uuidString]?.refresh()
+        widgets[stackID.uuidString]?.show(focus: true)
     }
     func setPinned(_ id: UUID, pinned: Bool) {
         guard let note = store.note(id) else { return }
@@ -246,8 +267,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationShouldHandleReopen(_ sender: NSApplication, hasVisibleWindows flag: Bool) -> Bool { showLibrary(); return true }
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool { false }
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
-        if store.pendingImports > 0 { waitingToQuit = true; return .terminateLater }
+        if store.pendingImports > 0 {
+            waitingToQuit = true
+            if quitProgress == nil { quitProgress = ImportWaitController { [weak self] in self?.cancelPendingQuit() } }
+            quitProgress?.showWindow(nil); quitProgress?.window?.makeKeyAndOrderFront(nil)
+            NSApp.activate(ignoringOtherApps: true)
+            return .terminateLater
+        }
         return saveBeforeQuit() ? .terminateNow : .terminateCancel
+    }
+    func cancelPendingQuit() {
+        guard waitingToQuit else { return }
+        waitingToQuit = false; quitProgress?.close(); quitProgress = nil
+        replyToTermination(false)
     }
     func saveBeforeQuit() -> Bool {
         do { try store.flush(); return true }
@@ -315,6 +347,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         capture(appearance.view, "appearance")
         setPinned(first.id, pinned: true)
         let sharedPin = store.note(second.id)?.pinned == true
+        stackWidget.activeID = second.id; stackWidget.refresh()
+        stackWidget.textView.setSelectedRange(NSRange(location: 3, length: 2))
+        store.update(first.id) { $0.hidden = true }
+        let preservedOnHide = widgets[stackID.uuidString] === stackWidget && stackWidget.activeID == second.id && stackWidget.textView.selectedRange() == NSRange(location: 3, length: 2)
+        store.update(first.id) { $0.hidden = false }
+        let activeTabPreserved = preservedOnHide && widgets[stackID.uuidString] === stackWidget && stackWidget.activeID == second.id && stackWidget.textView.selectedRange() == NSRange(location: 3, length: 2)
+        stackWidget.activeID = first.id; stackWidget.refresh()
+
         let tabsAccessible = stackWidget.tabs.arrangedSubviews.filter { $0 is NSButton && ($0 as? NSButton)?.toolTip != "More notes" }.allSatisfy {
             $0.accessibilityRole() == .radioButton && !($0.accessibilityLabel() ?? "").isEmpty
         }
@@ -345,10 +385,53 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         library?.close()
         preferences?.close()
         let staysAfterClosingUI = library == nil && widgets.values.allSatisfy { $0.window?.isVisible == true } && NSRunningApplication.current.activationPolicy == .accessory
-        store.delete(first.id); store.delete(second.id)
-        do { try store.flush() } catch { preconditionFailure("Smoke save failed: \(error)") }
-        print("SMOKE TEST: stacked=\(stacked) hidden=\(hidden) restored=\(restored) unstacked=\(unstacked) minimumLayout=\(minimumLayout) resizeGesture=\(resizeGesture) sharedPin=\(sharedPin) allRaised=\(allRaised) tabsAccessible=\(tabsAccessible) keyboardCycle=\(keyboardCycle) focusedControls=\(cardFocused && focusedControls) staysAfterClosingUI=\(staysAfterClosingUI) cleanup=\(store.notes.count == savedCount)")
-        precondition(stacked && hidden && restored && unstacked && minimumLayout && resizeGesture && sharedPin && allRaised && tabsAccessible && keyboardCycle && cardFocused && focusedControls && staysAfterClosingUI && store.notes.count == savedCount, "Widget lifecycle smoke test failed")
-        NSApp.terminate(nil)
+        let importSource = store.directory.appendingPathComponent("import-source.txt")
+        try! Data("import fixture".utf8).write(to: importSource)
+        store.attach([importSource], to: second.id)
+        let systemReply = replyToTermination
+        var cancellationReply: Bool?
+        replyToTermination = { cancellationReply = $0 }
+        let delayedReply = applicationShouldTerminate(NSApp) == .terminateLater
+        let quitWaitVisible = delayedReply && waitingToQuit && quitProgress?.window?.isVisible == true
+        cancelPendingQuit()
+        let quitWaitCancelled = !waitingToQuit && quitProgress == nil && cancellationReply == false
+        replyToTermination = systemReply
+        let broken = Attachment(name: "broken.png", storedName: "broken.png")
+        try! Data("invalid picture".utf8).write(to: store.attachmentURL(broken))
+        func finish(coalesced: Bool, failedPreviewCollapsed: Bool) {
+            if store.pendingImports > 0 {
+                let previous = store.onImportsFinished
+                store.onImportsFinished = { [self] in
+                    self.store.onImportsFinished = previous
+                    previous?()
+                    finish(coalesced: coalesced, failedPreviewCollapsed: failedPreviewCollapsed)
+                }
+                return
+            }
+            store.delete(first.id); store.delete(second.id)
+            do { try store.flush() } catch { preconditionFailure("Smoke save failed: \(error)") }
+            print("SMOKE TEST: stacked=\(stacked) hidden=\(hidden) restored=\(restored) unstacked=\(unstacked) minimumLayout=\(minimumLayout) resizeGesture=\(resizeGesture) sharedPin=\(sharedPin) allRaised=\(allRaised) tabsAccessible=\(tabsAccessible) keyboardCycle=\(keyboardCycle) focusedControls=\(cardFocused && focusedControls) staysAfterClosingUI=\(staysAfterClosingUI) activeTabPreserved=\(activeTabPreserved) quitWaitVisible=\(quitWaitVisible) quitWaitCancelled=\(quitWaitCancelled) thumbnailCoalesced=\(coalesced) failedPreviewCollapsed=\(failedPreviewCollapsed) cleanup=\(store.notes.count == savedCount)")
+            precondition(stacked && hidden && restored && unstacked && minimumLayout && resizeGesture && sharedPin && allRaised && tabsAccessible && keyboardCycle && cardFocused && focusedControls && staysAfterClosingUI && activeTabPreserved && quitWaitVisible && quitWaitCancelled && coalesced && failedPreviewCollapsed && store.notes.count == savedCount, "Desktop note regression failed")
+            NSApp.terminate(nil)
+        }
+        var loaded: [NSImage?] = []
+        func thumbnailLoaded(_ image: NSImage?) {
+            loaded.append(image)
+            guard loaded.count == 2 else { return }
+            let coalesced = loaded[0] != nil && loaded[0] === loaded[1]
+            // A failed image must release its reserved preview space after the async callback.
+            capture(stackWidget.surface, "attachments")
+            store.update(first.id) { $0.attachments = [broken] }
+            ThumbnailLoader.shared.load(store.attachmentURL(broken), pixels: 440) { invalid in
+                DispatchQueue.main.async {
+                    stackWidget.layoutNote()
+                    let collapsed = invalid == nil && stackWidget.attachments.frame.height == 22
+                    finish(coalesced: coalesced, failedPreviewCollapsed: collapsed)
+                }
+            }
+        }
+        ThumbnailLoader.shared.load(store.attachmentURL(picture), pixels: 440, completion: thumbnailLoaded)
+        ThumbnailLoader.shared.load(store.attachmentURL(picture), pixels: 440, completion: thumbnailLoaded)
+
     }
 }

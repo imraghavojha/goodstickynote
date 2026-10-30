@@ -8,6 +8,18 @@ import AppKit
     static func main() throws {
         let directory = FileManager.default.temporaryDirectory.appendingPathComponent("GoodStickyTests-" + UUID().uuidString)
         defer { try? FileManager.default.removeItem(at: directory) }
+        let lockDirectory = directory.appendingPathComponent("LockTest")
+        var firstLock: ResidentLock? = try ResidentLock(directory: lockDirectory)
+        withExtendedLifetime(firstLock) {
+            var rejected = false
+            do { _ = try ResidentLock(directory: lockDirectory) }
+            catch ResidentLock.Failure.alreadyRunning { rejected = true }
+            catch { fatalError("Unexpected lock failure: \(error)") }
+            check(rejected, "A second writer is rejected while the library lock is held")
+        }
+        firstLock = nil
+        let reopenedLock = try ResidentLock(directory: lockDirectory)
+        withExtendedLifetime(reopenedLock) { check(true, "Library lock is released when its owner closes") }
         let store = NoteStore(directory: directory)
         var note = StickyNote()
         note.text = "A thought\n日本語 & emoji 🌿"
@@ -33,6 +45,28 @@ import AppKit
         try FileManager.default.removeItem(at: source)
         let copied = try String(contentsOf: store.attachmentURL(attachment), encoding: .utf8)
         check(copied == "Keep this file", "Attachment is independent of original")
+        let linkedSource = directory.appendingPathComponent("linked-source.txt")
+        let symlink = directory.appendingPathComponent("reference.txt")
+        try Data("Independent link contents".utf8).write(to: linkedSource)
+        try FileManager.default.createSymbolicLink(at: symlink, withDestinationURL: linkedSource)
+        var linked = false
+        store.attach([symlink], to: note.id) { linked = true }
+        let linkDeadline = Date().addingTimeInterval(5)
+        while !linked && Date() < linkDeadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+        check(linked, "Symbolic-link import completes")
+        let linkedAttachment = store.note(note.id)!.attachments.last!
+        try FileManager.default.removeItem(at: linkedSource)
+        let linkCopy = try String(contentsOf: store.attachmentURL(linkedAttachment), encoding: .utf8)
+        let copyInfo = try store.attachmentURL(linkedAttachment).resourceValues(forKeys: [.isSymbolicLinkKey])
+        check(linkCopy == "Independent link contents" && copyInfo.isSymbolicLink != true, "Imported symlink becomes independent file contents")
+        let priorAttachments = store.note(note.id)!.attachments
+        var importErrors: [String] = []; store.onError = { importErrors.append($0) }
+        var folderFinished = false
+        store.attach([directory], to: note.id) { folderFinished = true }
+        let folderDeadline = Date().addingTimeInterval(5)
+        while !folderFinished && Date() < folderDeadline { RunLoop.current.run(until: Date().addingTimeInterval(0.01)) }
+        check(folderFinished && !importErrors.isEmpty && store.note(note.id)!.attachments == priorAttachments, "Folder drops are rejected without changing attachments")
+        store.onError = nil
         try store.flush()
         store.delete(note.id)
         check(FileManager.default.fileExists(atPath: store.attachmentURL(attachment).path), "Uncommitted deletion retains the copied attachment")

@@ -66,6 +66,17 @@ extension NSColor {
     }
 }
 
+enum LibraryLocation {
+    static var directory: URL {
+        (ProcessInfo.processInfo.environment["GOODSTICKY_DATA_DIR"].map { URL(fileURLWithPath: $0, isDirectory: true) } ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("GoodSticky", isDirectory: true)).standardizedFileURL.resolvingSymlinksInPath()
+    }
+}
+
+enum AttachmentImportError: LocalizedError {
+    case notRegularFile
+    var errorDescription: String? { "Choose a regular file instead of a folder or Finder alias." }
+}
+
 final class NoteStore {
     static let shared = NoteStore()
     var notes: [StickyNote] = []
@@ -82,7 +93,7 @@ final class NoteStore {
     private(set) var loadFailed = false
 
     init(directory: URL? = nil) {
-        self.directory = directory ?? ProcessInfo.processInfo.environment["GOODSTICKY_DATA_DIR"].map { URL(fileURLWithPath: $0, isDirectory: true) } ?? FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("GoodSticky", isDirectory: true)
+        self.directory = directory ?? LibraryLocation.directory
         do {
             try FileManager.default.createDirectory(at: self.directory.appendingPathComponent("Attachments"), withIntermediateDirectories: true)
             let file = self.directory.appendingPathComponent("notes.json")
@@ -157,15 +168,18 @@ final class NoteStore {
             var errors: [String] = []
             for url in urls {
                 do {
+                    let source = url.resolvingSymlinksInPath()
+                    let info = try source.resourceValues(forKeys: [.isRegularFileKey, .isAliasFileKey])
+                    guard source.isFileURL, info.isRegularFile == true, info.isAliasFile != true else { throw AttachmentImportError.notRegularFile }
                     let name = UUID().uuidString + "-" + url.lastPathComponent
                     let attachment = Attachment(name: url.lastPathComponent, storedName: name)
-                    try FileManager.default.copyItem(at: url, to: destination.appendingPathComponent(name))
+                    try FileManager.default.copyItem(at: source, to: destination.appendingPathComponent(name))
                     copied.append(attachment)
                 } catch { errors.append("Couldn’t attach \(url.lastPathComponent): \(error.localizedDescription)") }
             }
             DispatchQueue.main.async {
                 guard let self else { completion?(); return }
-                if self.note(id) != nil {
+                if self.note(id) != nil && !copied.isEmpty {
                     self.update(id) { $0.attachments.append(contentsOf: copied) }
                 } else {
                     for attachment in copied { try? FileManager.default.removeItem(at: self.attachmentURL(attachment)) }

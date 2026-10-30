@@ -102,3 +102,22 @@ final class SwatchButton: NSButton {
         }
     }
 }
+
+final class ImportWaitController: NSWindowController {
+    private let progress = NSProgressIndicator(frame: NSRect(x: 18, y: 65, width: 18, height: 18))
+    init(cancel: @escaping () -> Void) {
+        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 110), styleMask: [.titled], backing: .buffered, defer: false)
+        super.init(window: window)
+        window.title = "Importing files"; window.level = .floating; window.isReleasedWhenClosed = false
+        window.appearance = NSAppearance(named: .aqua); window.center()
+        let root = SurfaceView(fill: canvas, radius: 0); window.contentView = root
+        progress.style = .spinning; progress.controlSize = .small; progress.startAnimation(nil); root.addSubview(progress)
+        let text = label("Quitting when imports finish.", size: 12)
+        text.frame = NSRect(x: 47, y: 65, width: 240, height: 18); root.addSubview(text)
+        let keep = ActionButton("Keep running", action: cancel)
+        keep.isBordered = true; keep.bezelStyle = .rounded; keep.frame = NSRect(x: 164, y: 17, width: 118, height: 30)
+        keep.keyEquivalent = "\u{1b}"; root.addSubview(keep)
+    }
+    override func close() { progress.stopAnimation(nil); super.close() }
+    required init?(coder: NSCoder) { fatalError() }
+}

@@ -11,6 +11,8 @@ jobs:
         run: ./scripts/test.sh
       - name: Build native app
         run: ./scripts/build.sh
+      - name: Atomic installer checks
+        run: ./scripts/test-install.sh
       - name: AppKit widget lifecycle smoke test
         run: dist/GoodSticky.app/Contents/MacOS/GoodSticky --smoke-test
       - name: Archive app with executable permissions

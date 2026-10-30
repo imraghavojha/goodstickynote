@@ -165,6 +165,9 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
     let grip = ResizeGrip(frame: .zero)
     private var appearancePopover: NSPopover?
     private var attachmentKey = ""
+    private var failedPreviewIDs = Set<UUID>()
+    private var importsInProgress = 0
+    private let importSpinner = NSProgressIndicator()
     private var tabCapacity = 0
     private var configuring = false
     private var layingOut = false
@@ -210,6 +213,9 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
             guard let self else { return }; self.store.update(self.activeID) { $0.hidden = true }
         }
         let attach = ActionButton("Attach files", symbol: "paperclip") { [weak self] in self?.showAttachments() }
+        importSpinner.frame = NSRect(x: 3, y: 4, width: 15, height: 15)
+        importSpinner.style = .spinning; importSpinner.controlSize = .small; importSpinner.isDisplayedWhenStopped = false; importSpinner.isHidden = true
+        importSpinner.setAccessibilityLabel("Importing files"); attach.addSubview(importSpinner)
         let appearance = ActionButton("Color and opacity", symbol: "paintpalette") { [weak self] in self?.showAppearance() }
         let menu = ActionButton("Note options", symbol: "ellipsis") { [weak self] in self?.showMenu() }
         controls.orientation = .horizontal; controls.spacing = 0; controls.isHidden = true
@@ -239,14 +245,15 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         surface.addSubview(attachments); surface.addSubview(tabs); surface.addSubview(grip)
         surface.onHover = { [weak self] hovering in
             guard let self else { return }
-            self.controls.isHidden = !hovering && self.window?.isKeyWindow != true
+            self.controls.isHidden = !hovering && self.window?.isKeyWindow != true && self.importsInProgress == 0
         }
         surface.onDrop = { [weak self] in self?.addFiles($0) }
         surface.onLayout = { [weak self] in self?.layoutNote() }
     }
     func refreshCaption() { caption.stringValue = ids.count > 1 ? "\(ids.count) notes" : "" }
-    func refresh() {
-        guard let note, note != lastRenderedNote else { return }
+    func refresh(using supplied: StickyNote? = nil) {
+        guard let note = supplied ?? self.note, note != lastRenderedNote else { return }
+        let previous = lastRenderedNote
         lastRenderedNote = note; configuring = true
         window?.title = note.title
         surface.theme = note.theme; surface.paperOpacity = note.opacity
@@ -264,8 +271,10 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
             attachmentButton.setAccessibilityLabel(attachmentButton.toolTip)
         }
         refreshCaption()
-        if !transientFront && !groupRaised { setLevel() }
-        attachmentKey = ""; tabCapacity = 0
+        if note.pinned { window?.level = .floating }
+        else if !transientFront && !groupRaised && window?.isKeyWindow != true && appearancePopover?.isShown != true && window?.attachedSheet == nil { setLevel() }
+        failedPreviewIDs.formIntersection(Set(note.attachments.map(\.id)))
+        if previous?.id != note.id || previous?.themeID != note.themeID { tabCapacity = 0 }
         configuring = false; layoutNote()
     }
     func layoutNote() {
@@ -286,7 +295,8 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         tabs.frame = NSRect(x: 12, y: bottom, width: max(0, width - 32), height: tabHeight)
         if tabHeight > 0 { bottom += tabHeight + 5 }
         let budget = max(0, height - 28 - bottom - 48)
-        let previewHeight: CGFloat = height >= 240 && budget >= 94 ? 64 : height >= 180 && budget >= 70 ? 40 : 0
+        let hasPreview = note.attachments.contains { !failedPreviewIDs.contains($0.id) && UTType(filenameExtension: URL(fileURLWithPath: $0.name).pathExtension)?.conforms(to: .image) == true }
+        let previewHeight: CGFloat = !hasPreview ? 0 : height >= 240 && budget >= 94 ? 64 : height >= 180 && budget >= 70 ? 40 : 0
         let showImage = previewHeight > 0
         let rowCount = height >= 270 ? min(2, note.attachments.count) : height >= 145 ? min(1, note.attachments.count) : 0
         let key = "\(activeID)-\(note.themeID)-\(note.attachments.map(\.id))-\(rowCount)-\(previewHeight)"
@@ -299,6 +309,18 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         attachments.frame = NSRect(x: 12, y: bottom, width: max(0, width - 24), height: attachmentHeight)
         if attachmentHeight > 0 { bottom += attachmentHeight + 6 }
         scroll.frame = NSRect(x: 10, y: bottom, width: max(0, width - 20), height: max(20, height - 28 - bottom))
+    }
+    override func close() { importSpinner.stopAnimation(nil); appearancePopover?.close(); super.close() }
+    func updateMembers(_ members: [UUID]) {
+        let sameEditor = members.contains(activeID)
+        ids = members
+        if !sameEditor { activeID = members[0]; lastRenderedNote = nil }
+        tabCapacity = 0; refreshCaption()
+        if let note, let frame = window?.frame {
+            let desired = NSRect(x: note.x, y: note.y, width: note.width, height: note.height)
+            if frame != desired { configuring = true; window?.setFrame(desired, display: true); configuring = false }
+        }
+        refresh(); layoutNote()
     }
     func setLevel() {
         guard let note else { return }
@@ -313,7 +335,7 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
     func bringForward() { groupRaised = true; transientFront = false; window?.level = .floating; window?.orderFrontRegardless() }
     func returnToDesktop() { groupRaised = false; transientFront = false; setLevel() }
     func windowDidResignKey(_ notification: Notification) {
-        transientFront = false; if !groupRaised && appearancePopover?.isShown != true && window?.attachedSheet == nil { setLevel() }; controls.isHidden = true
+        transientFront = false; if !groupRaised && appearancePopover?.isShown != true && window?.attachedSheet == nil { setLevel() }; controls.isHidden = importsInProgress == 0
         if AppDelegate.shared.library?.window?.isVisible == true { AppDelegate.shared.library?.refresh() }
     }
     func windowDidBecomeKey(_ notification: Notification) { controls.isHidden = false }
@@ -329,8 +351,21 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         window?.title = note?.title ?? "Untitled note"
     }
     func addFiles(_ urls: [URL]) {
-        caption.stringValue = "Adding files…"
-        store.attach(urls, to: activeID) { [weak self] in self?.refreshCaption() }
+        guard !urls.isEmpty else { return }
+        importsInProgress += 1; controls.isHidden = false; importSpinner.isHidden = false; importSpinner.startAnimation(nil)
+        if let button = controls.arrangedSubviews.dropFirst(2).first as? NSButton { button.image = nil; button.isEnabled = false; button.toolTip = "Importing files" }
+        store.attach(urls, to: activeID) { [weak self] in
+            guard let self else { return }
+            self.importsInProgress -= 1
+            if self.importsInProgress == 0 {
+                self.importSpinner.stopAnimation(nil); self.importSpinner.isHidden = true
+                if let button = self.controls.arrangedSubviews.dropFirst(2).first as? NSButton {
+                    button.image = NSImage(systemSymbolName: "paperclip", accessibilityDescription: "Attachments"); button.isEnabled = true
+                    button.toolTip = self.note?.attachments.isEmpty == false ? "Attachments" : "Attach files"
+                }
+                self.controls.isHidden = self.window?.isKeyWindow != true && !self.surface.bounds.contains(self.surface.convert(self.window?.mouseLocationOutsideOfEventStream ?? .zero, from: nil))
+            }
+        }
     }
     func showAttachments() {
         guard let note, !note.attachments.isEmpty else { chooseFiles(); return }
@@ -354,13 +389,20 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
     func rebuildAttachments(rows: Int, imageHeight: CGFloat) {
         attachments.arrangedSubviews.forEach { attachments.removeArrangedSubview($0); $0.removeFromSuperview() }
         guard let note else { return }
-        if imageHeight > 0, let picture = note.attachments.first(where: { UTType(filenameExtension: URL(fileURLWithPath: $0.name).pathExtension)?.conforms(to: .image) == true }) {
+        if imageHeight > 0, let picture = note.attachments.first(where: { !failedPreviewIDs.contains($0.id) && UTType(filenameExtension: URL(fileURLWithPath: $0.name).pathExtension)?.conforms(to: .image) == true }) {
             let preview = ActionButton("Open " + picture.name) { [weak self] in guard let self else { return }; NSWorkspace.shared.open(self.store.attachmentURL(picture)) }
             preview.title = ""; preview.imageScaling = .scaleProportionallyUpOrDown
             attachments.addArrangedSubview(preview); preview.translatesAutoresizingMaskIntoConstraints = false
             preview.widthAnchor.constraint(equalTo: attachments.widthAnchor).isActive = true
             preview.heightAnchor.constraint(equalToConstant: imageHeight).isActive = true
-            ThumbnailLoader.shared.load(store.attachmentURL(picture), pixels: 440) { [weak preview] image in preview?.image = image }
+            ThumbnailLoader.shared.load(store.attachmentURL(picture), pixels: 440) { [weak self, weak preview] image in
+                if let image { preview?.image = image }
+                else {
+                    self?.failedPreviewIDs.insert(picture.id)
+                    self?.attachmentKey = ""
+                    DispatchQueue.main.async { [weak self] in self?.layoutNote() }
+                }
+            }
         }
         for attachment in note.attachments.prefix(rows) {
             let row = NSStackView(); row.spacing = 4
@@ -474,17 +516,30 @@ final class ClosureMenuItem: NSMenuItem {
 final class ThumbnailLoader {
     static let shared = ThumbnailLoader()
     private let cache = NSCache<NSString, NSImage>()
+    private let failures = NSCache<NSString, NSNumber>()
     private let queue = DispatchQueue(label: "app.goodsticky.thumbnails", qos: .utility)
-    init() { cache.countLimit = 24; cache.totalCostLimit = 4 * 1024 * 1024 }
+    private let lock = NSLock()
+    private var pending: [NSString: [(NSImage?) -> Void]] = [:]
+    init() { cache.countLimit = 24; cache.totalCostLimit = 4 * 1024 * 1024; failures.countLimit = 24 }
     func load(_ url: URL, pixels: Int, completion: @escaping (NSImage?) -> Void) {
         let key = (url.path + "-" + String(pixels)) as NSString
-        if let image = cache.object(forKey: key) { completion(image); return }
+        lock.lock()
+        if let image = cache.object(forKey: key) {
+            lock.unlock(); DispatchQueue.main.async { completion(image) }; return
+        }
+        if failures.object(forKey: key) != nil { lock.unlock(); DispatchQueue.main.async { completion(nil) }; return }
+        if pending[key] != nil { pending[key]?.append(completion); lock.unlock(); return }
+        pending[key] = [completion]; lock.unlock()
         queue.async { [weak self] in
-            guard let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-                  let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: pixels, kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) else { DispatchQueue.main.async { completion(nil) }; return }
-            let image = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
-            self?.cache.setObject(image, forKey: key, cost: cg.bytesPerRow * cg.height)
-            DispatchQueue.main.async { completion(image) }
+            guard let self else { return }
+            var result: NSImage?
+            if let source = CGImageSourceCreateWithURL(url as CFURL, nil),
+               let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: pixels, kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) {
+                result = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
+                self.cache.setObject(result!, forKey: key, cost: cg.bytesPerRow * cg.height)
+            } else { self.failures.setObject(true, forKey: key) }
+            self.lock.lock(); let callbacks = self.pending.removeValue(forKey: key) ?? []; self.lock.unlock()
+            DispatchQueue.main.async { for callback in callbacks { callback(result) } }
         }
     }
 }
