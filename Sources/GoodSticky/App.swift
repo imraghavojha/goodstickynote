@@ -51,7 +51,7 @@ final class HotKeyManager {
         if preferences.modifiers & UInt32(shiftKey) != 0 { prefix += "⇧" }
         if preferences.modifiers & UInt32(cmdKey) != 0 { prefix += "⌘" }
         let keys: [UInt32: String] = [0:"A",1:"S",2:"D",3:"F",4:"H",5:"G",6:"Z",7:"X",8:"C",9:"V",11:"B",12:"Q",13:"W",14:"E",15:"R",16:"Y",17:"T",18:"1",19:"2",20:"3",21:"4",22:"6",23:"5",24:"=",25:"9",26:"7",27:"−",28:"8",29:"0",30:"]",31:"O",32:"U",33:"[",34:"I",35:"P",36:"↩",37:"L",38:"J",39:"'",40:"K",41:";",42:"\\",43:",",44:"/",45:"N",46:"M",47:".",48:"⇥",49:"Space",50:"`",51:"⌫",123:"←",124:"→",125:"↓",126:"↑"]
-        return prefix + "  " + (keys[preferences.keyCode] ?? "Key \(preferences.keyCode)")
+        return prefix + (keys[preferences.keyCode] ?? "Key \(preferences.keyCode)")
     }
 }
 
@@ -66,7 +66,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var refreshing = false
     private var waitingToQuit = false
     private var outsideClickMonitor: Any?
-    private var statusMenu: NSMenu?
     private var quitProgress: ImportWaitController?
     private var replyToTermination: (Bool) -> Void = { NSApp.reply(toApplicationShouldTerminate: $0) }
 
@@ -77,25 +76,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DistributedNotificationCenter.default().addObserver(self, selector: #selector(showNotesRequested), name: Notification.Name("app.goodsticky.showNotes"), object: store.directory.path)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
         statusItem.button?.image = NSImage(systemSymbolName: "note.text", accessibilityDescription: "GoodSticky")
-        statusItem.button?.toolTip = "GoodSticky — your desktop notes"
-        let menu = NSMenu()
-        let new = ClosureMenuItem("New note") { [weak self] in self?.createNote() }; new.keyEquivalent = "n"; menu.addItem(new)
-        menu.addItem(ClosureMenuItem("Notes…") { [weak self] in self?.showLibrary() })
-        menu.addItem(.separator())
-        menu.addItem(ClosureMenuItem("Bring notes forward") { [weak self] in self?.bringAllForward() })
-        menu.addItem(ClosureMenuItem("Show all notes") { [weak self] in
-            guard let self else { return }
-            self.store.updateMany(self.store.notes.map(\.id)) { $0.hidden = false }
-        })
-        menu.addItem(ClosureMenuItem("Hide all notes") { [weak self] in
-            guard let self else { return }
-            self.store.updateMany(self.store.notes.map(\.id)) { $0.hidden = true }
-        })
-        menu.addItem(.separator())
-        menu.addItem(ClosureMenuItem("Preferences…") { [weak self] in self?.showPreferences() })
-        menu.addItem(.separator())
-        let quit = ClosureMenuItem("Quit GoodSticky") { NSApp.terminate(nil) }; quit.keyEquivalent = "q"; menu.addItem(quit)
-        statusMenu = menu
+        statusItem.button?.toolTip = "GoodSticky — click for notes, right-click for more"
         statusItem.button?.target = self
         statusItem.button?.action = #selector(statusClicked(_:))
         statusItem.button?.sendAction(on: [.leftMouseUp, .rightMouseUp])
@@ -128,6 +109,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         store.onChange = { [weak self] in self?.synchronize() }
         synchronize()
         if store.loadFailed || CommandLine.arguments.contains("--smoke-test") || CommandLine.arguments.contains("--show-library") { showLibrary() }
+        if CommandLine.arguments.contains("--show-preferences") { showPreferences() }
         if store.loadFailed {
             let alert = NSAlert(); alert.messageText = "Your library couldn’t be opened"; alert.informativeText = "Your original notes have been left untouched at \(store.directory.path). Quit GoodSticky and restore notes.json from a backup before adding notes."; alert.runModal()
         }
@@ -136,9 +118,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
     }
     @objc func showNotesRequested() { showLibrary() }
+    /// Built on demand so it always reflects the current shortcut and note counts.
+    func makeStatusMenu() -> NSMenu {
+        let menu = NSMenu()
+        func add(_ title: String, _ symbolName: String, enabled: Bool = true, _ action: @escaping () -> Void) -> NSMenuItem {
+            let item = ClosureMenuItem(title, action: action); item.image = symbol(symbolName, size: 13, weight: .regular)
+            item.isEnabled = enabled; if !enabled { item.target = nil; item.action = nil }
+            menu.addItem(item); return item
+        }
+        let new = add("New Note", "square.and.pencil") { [weak self] in self?.createNote() }
+        let shortcut = HotKeyManager.display(store.preferences)
+        let attributed = NSMutableAttributedString(string: "New Note")
+        attributed.append(NSAttributedString(string: "   " + shortcut, attributes: [.foregroundColor: NSColor.tertiaryLabelColor, .font: NSFont.menuFont(ofSize: 0)]))
+        new.attributedTitle = attributed
+        _ = add("All Notes…", "list.bullet.rectangle") { [weak self] in self?.showLibrary() }
+        menu.addItem(.separator())
+        let visible = store.notes.filter { !$0.hidden }.count, hidden = store.notes.count - visible
+        _ = add("Bring Notes Forward", "square.stack.3d.up", enabled: visible > 0) { [weak self] in self?.bringAllForward() }
+        _ = add(hidden > 0 ? "Show All Notes (\(hidden) hidden)" : "Show All Notes", "eye", enabled: hidden > 0) { [weak self] in
+            guard let self else { return }
+            self.store.updateMany(self.store.notes.map(\.id)) { $0.hidden = false }
+        }
+        _ = add("Hide All Notes", "eye.slash", enabled: visible > 0) { [weak self] in
+            guard let self else { return }
+            self.store.updateMany(self.store.notes.map(\.id)) { $0.hidden = true }
+        }
+        menu.addItem(.separator())
+        let settings = add("Settings…", "gearshape") { [weak self] in self?.showPreferences() }; settings.keyEquivalent = ","
+        menu.addItem(.separator())
+        let quit = add("Quit GoodSticky", "power") { NSApp.terminate(nil) }; quit.keyEquivalent = "q"
+        return menu
+    }
     @objc func statusClicked(_ sender: NSStatusBarButton) {
         if NSApp.currentEvent?.type == .rightMouseUp || NSApp.currentEvent?.modifierFlags.contains(.option) == true {
-            statusMenu?.popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.minY), in: sender)
+            makeStatusMenu().popUp(positioning: nil, at: NSPoint(x: 0, y: sender.bounds.minY - 4), in: sender)
         } else if library?.window?.isVisible == true { library?.close() }
         else { showLibrary() }
     }
@@ -146,9 +159,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let main = NSMenu()
         let appItem = NSMenuItem(); let appMenu = NSMenu()
         appMenu.addItem(ClosureMenuItem("About GoodSticky") {
-            NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "GoodSticky", .applicationVersion: "0.1.0"])
+            NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "GoodSticky", .applicationVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.0"])
         })
-        let settings = ClosureMenuItem("Preferences…") { self.showPreferences() }; settings.keyEquivalent = ","; appMenu.addItem(settings)
+        let settings = ClosureMenuItem("Settings…") { self.showPreferences() }; settings.keyEquivalent = ","; appMenu.addItem(settings)
         appMenu.addItem(.separator())
         let quit = ClosureMenuItem("Quit GoodSticky") { NSApp.terminate(nil) }; quit.keyEquivalent = "q"; appMenu.addItem(quit)
         appItem.submenu = appMenu; main.addItem(appItem)

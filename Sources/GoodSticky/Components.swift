@@ -1,9 +1,11 @@
 import AppKit
 
-let canvas = NSColor.hex(0xF7F6F2)
-let primaryInk = NSColor.hex(0x29342F)
-let secondaryInk = NSColor.hex(0x5F685F)
-let accent = NSColor.hex(0x44735D)
+// Management UI follows the system appearance (light/dark) and accent color.
+let canvas = NSColor.windowBackgroundColor
+let primaryInk = NSColor.labelColor
+let secondaryInk = NSColor.secondaryLabelColor
+let tertiaryInk = NSColor.tertiaryLabelColor
+let accent = NSColor.controlAccentColor
 
 func label(_ text: String, size: CGFloat = 13, weight: NSFont.Weight = .regular, color: NSColor = primaryInk) -> NSTextField {
     let field = NSTextField(labelWithString: text)
@@ -13,7 +15,7 @@ func label(_ text: String, size: CGFloat = 13, weight: NSFont.Weight = .regular,
     return field
 }
 
-final class ActionButton: NSButton {
+class ActionButton: NSButton {
     var actionHandler: (() -> Void)?
     var focusChanged: ((Bool) -> Void)?
     override func becomeFirstResponder() -> Bool {
@@ -93,12 +95,12 @@ final class SwatchButton: NSButton {
     required init?(coder: NSCoder) { fatalError() }
     @objc private func choose() { handler?() }
     override func draw(_ dirtyRect: NSRect) {
-        let circle = NSBezierPath(ovalIn: bounds.insetBy(dx: 3, dy: 3))
+        let circle = NSBezierPath(ovalIn: bounds.insetBy(dx: 3.5, dy: 3.5))
         theme.paper.setFill(); circle.fill()
         theme.ink.withAlphaComponent(0.12).setStroke(); circle.lineWidth = 1; circle.stroke()
         if selected {
-            theme.ink.withAlphaComponent(0.75).setStroke()
-            let ring = NSBezierPath(ovalIn: bounds.insetBy(dx: 0.8, dy: 0.8)); ring.lineWidth = 1.5; ring.stroke()
+            NSColor.controlAccentColor.setStroke()
+            let ring = NSBezierPath(ovalIn: bounds.insetBy(dx: 1, dy: 1)); ring.lineWidth = 2; ring.stroke()
         }
     }
 }
@@ -109,7 +111,7 @@ final class ImportWaitController: NSWindowController {
         let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 300, height: 110), styleMask: [.titled], backing: .buffered, defer: false)
         super.init(window: window)
         window.title = "Importing files"; window.level = .floating; window.isReleasedWhenClosed = false
-        window.appearance = NSAppearance(named: .aqua); window.center()
+        window.center()
         let root = SurfaceView(fill: canvas, radius: 0); window.contentView = root
         progress.style = .spinning; progress.controlSize = .small; progress.startAnimation(nil); root.addSubview(progress)
         let text = label("Quitting when imports finish.", size: 12)
@@ -120,4 +122,99 @@ final class ImportWaitController: NSWindowController {
     }
     override func close() { progress.stopAnimation(nil); super.close() }
     required init?(coder: NSCoder) { fatalError() }
+}
+
+func symbol(_ name: String, size: CGFloat = 13, weight: NSFont.Weight = .medium, description: String? = nil) -> NSImage? {
+    NSImage(systemSymbolName: name, accessibilityDescription: description)?.withSymbolConfiguration(.init(pointSize: size, weight: weight))
+}
+
+/// Borderless icon button with a soft rounded hover/press background, like toolbar buttons.
+final class IconButton: ActionButton {
+    private var tracking: NSTrackingArea?
+    private var hovering = false { didSet { needsDisplay = true } }
+    init(_ title: String, symbol name: String, size: CGFloat = 13, action: @escaping () -> Void) {
+        super.init(title, action: action)
+        self.title = ""
+        image = symbol(name, size: size, description: title)
+        imagePosition = .imageOnly
+        contentTintColor = secondaryInk
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        tracking = NSTrackingArea(rect: bounds, options: [.activeInKeyWindow, .mouseEnteredAndExited, .inVisibleRect], owner: self)
+        addTrackingArea(tracking!)
+    }
+    override func mouseEntered(with event: NSEvent) { hovering = true }
+    override func mouseExited(with event: NSEvent) { hovering = false }
+    override func viewDidMoveToWindow() { super.viewDidMoveToWindow(); hovering = false }
+    override func draw(_ dirtyRect: NSRect) {
+        if hovering || isHighlighted {
+            NSColor.labelColor.withAlphaComponent(isHighlighted ? 0.16 : 0.08).setFill()
+            NSBezierPath(roundedRect: bounds, xRadius: 6, yRadius: 6).fill()
+        }
+        super.draw(dirtyRect)
+    }
+}
+
+/// A grouped settings box in the style of System Settings: rounded fill, rows separated by hairlines.
+final class FormSection: NSView {
+    private let stack = NSStackView()
+    init(rows: [NSView]) {
+        super.init(frame: .zero)
+        translatesAutoresizingMaskIntoConstraints = false
+        stack.orientation = .vertical; stack.spacing = 0; stack.alignment = .leading
+        constrain(stack, in: self)
+        for (index, row) in rows.enumerated() {
+            if index > 0 {
+                let line = SeparatorLine(); stack.addArrangedSubview(line)
+                line.leadingAnchor.constraint(equalTo: leadingAnchor, constant: 14).isActive = true
+                line.trailingAnchor.constraint(equalTo: trailingAnchor, constant: -14).isActive = true
+            }
+            stack.addArrangedSubview(row)
+            row.widthAnchor.constraint(equalTo: widthAnchor).isActive = true
+        }
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        wantsLayer = true
+        layer?.cornerRadius = 10; layer?.cornerCurve = .continuous
+        layer?.backgroundColor = NSColor.labelColor.withAlphaComponent(0.045).cgColor
+        layer?.borderColor = NSColor.labelColor.withAlphaComponent(0.07).cgColor; layer?.borderWidth = 1
+    }
+    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
+
+    /// A row: title (and optional caption) on the left, accessory on the right.
+    static func row(_ title: String, caption: String? = nil, accessory: NSView, height: CGFloat = 44) -> NSView {
+        let row = NSView(); row.translatesAutoresizingMaskIntoConstraints = false
+        let text = NSStackView(); text.orientation = .vertical; text.alignment = .leading; text.spacing = 1
+        text.addArrangedSubview(label(title, size: 13))
+        if let caption { let detail = label(caption, size: 11, color: secondaryInk); text.addArrangedSubview(detail) }
+        text.translatesAutoresizingMaskIntoConstraints = false; accessory.translatesAutoresizingMaskIntoConstraints = false
+        row.addSubview(text); row.addSubview(accessory)
+        NSLayoutConstraint.activate([
+            row.heightAnchor.constraint(greaterThanOrEqualToConstant: height),
+            text.leadingAnchor.constraint(equalTo: row.leadingAnchor, constant: 14), text.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            text.topAnchor.constraint(greaterThanOrEqualTo: row.topAnchor, constant: 8),
+            accessory.trailingAnchor.constraint(equalTo: row.trailingAnchor, constant: -14), accessory.centerYAnchor.constraint(equalTo: row.centerYAnchor),
+            accessory.leadingAnchor.constraint(greaterThanOrEqualTo: text.trailingAnchor, constant: 12)
+        ])
+        return row
+    }
+}
+
+final class SeparatorLine: NSView {
+    override init(frame: NSRect) { super.init(frame: frame); translatesAutoresizingMaskIntoConstraints = false; heightAnchor.constraint(equalToConstant: 1).isActive = true }
+    required init?(coder: NSCoder) { fatalError() }
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() { wantsLayer = true; layer?.backgroundColor = NSColor.separatorColor.cgColor }
+    override func viewDidChangeEffectiveAppearance() { super.viewDidChangeEffectiveAppearance(); needsDisplay = true }
+}
+
+func sectionHeader(_ text: String) -> NSTextField {
+    let field = label(text, size: 11, weight: .semibold, color: secondaryInk)
+    field.translatesAutoresizingMaskIntoConstraints = false
+    return field
 }
