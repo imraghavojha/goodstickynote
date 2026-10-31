@@ -259,6 +259,11 @@ final class NoteCard: NSView {
         }
 
         let textX: CGFloat = 58
+        // Semantic secondary colors use vibrancy in native controls. Custom-drawn
+        // text needs opaque colors or it can turn nearly black on a dark sidebar.
+        let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
+        let secondaryInk = NSColor(calibratedWhite: dark ? 0.82 : 0.35, alpha: 1)
+        let tertiaryInk = NSColor(calibratedWhite: dark ? 0.73 : 0.43, alpha: 1)
         let available = bounds.width - textX - (buttons.first?.isHidden == false ? 104 : 12)
         let style = NSMutableParagraphStyle(); style.lineBreakMode = .byTruncatingTail
         let title = note.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Empty note" : note.title
