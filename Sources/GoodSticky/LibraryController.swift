@@ -136,6 +136,7 @@ final class NoteCard: NSView {
     private var buttons: [IconButton] = []
     /// Hidden notes keep a one-click delete visible at all times; no confirmation.
     private(set) var deleteButton: IconButton?
+    private static let snoozeFormatter: DateFormatter = { let f = DateFormatter(); f.setLocalizedDateFormatFromTemplate("EEEjmm"); return f }()
     private static let relative: RelativeDateTimeFormatter = { let f = RelativeDateTimeFormatter(); f.unitsStyle = .short; return f }()
     init(note: StickyNote?) {
         self.note = note; super.init(frame: .zero)
@@ -268,7 +269,7 @@ final class NoteCard: NSView {
         note.theme.ink.withAlphaComponent(0.16).setFill(); corner.fill()
         note.theme.ink.withAlphaComponent(0.32).setFill()
         for (index, width) in [16.0, 20, 12].enumerated() { NSBezierPath(roundedRect: NSRect(x: chip.minX + 6, y: chip.maxY - 14 - CGFloat(index) * 6, width: width, height: 2), xRadius: 1, yRadius: 1).fill() }
-        if note.hidden, let slash = symbol("eye.slash.fill", size: 10, weight: .semibold) {
+        if note.hidden, let slash = symbol(note.snoozedUntil == nil ? "eye.slash.fill" : "moon.zzz.fill", size: 10, weight: .semibold) {
             let tinted = slash.copy() as! NSImage; tinted.isTemplate = true
             NSGraphicsContext.saveGraphicsState(); note.theme.ink.withAlphaComponent(0.7).set()
             let rect = NSRect(x: chip.midX - 6, y: chip.minY + 4, width: 13, height: 10)
@@ -294,6 +295,8 @@ final class NoteCard: NSView {
         if !note.attachments.isEmpty { meta.append("\(note.attachments.count) \(note.attachments.count == 1 ? "file" : "files")") }
         if note.stackID != nil { meta.append("Stacked") }
         if note.pinned { meta.append("Above apps") }
+        if note.dockEdge != nil { meta.append("Side note") }
+        if note.hidden, let wake = note.snoozedUntil { meta.insert("Snoozed until " + Self.snoozeFormatter.string(from: wake), at: 0) }
         (meta.joined(separator: " · ") as NSString).draw(in: NSRect(x: textX, y: 10, width: available, height: 15), withAttributes: [.font: NSFont.systemFont(ofSize: 11), .foregroundColor: tertiaryInk, .paragraphStyle: style])
     }
 }

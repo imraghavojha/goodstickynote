@@ -12,6 +12,7 @@ final class PreferencesController: NSWindowController, NSWindowDelegate {
     let login = NSSwitch()
     var monitor: Any?
     var swatches: [SwatchButton] = []
+    private(set) var snoozeBoxes: [NSButton] = []
     init() {
         let window = PreferencesWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 380), styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
         super.init(window: window)
@@ -54,19 +55,42 @@ final class PreferencesController: NSWindowController, NSWindowDelegate {
             FormSection.row("Color", accessory: colors),
             FormSection.row("Paper opacity", accessory: opacity)
         ])
+        // Snooze times offered by each note's snooze button.
+        let grid = NSGridView(numberOfColumns: 2, rows: 0)
+        grid.rowSpacing = 7; grid.columnSpacing = 18
+        let chosen = Set(NoteStore.shared.preferences.snoozeOptions)
+        for option in SnoozeOption.allCases {
+            let box = NSButton(checkboxWithTitle: option.settingsTitle, target: self, action: #selector(snoozeChanged))
+            box.identifier = NSUserInterfaceItemIdentifier(option.rawValue)
+            box.state = chosen.contains(option) ? .on : .off; box.controlSize = .small; box.font = .systemFont(ofSize: 12)
+            snoozeBoxes.append(box)
+        }
+        for pair in stride(from: 0, to: snoozeBoxes.count, by: 2) {
+            grid.addRow(with: [snoozeBoxes[pair], pair + 1 < snoozeBoxes.count ? snoozeBoxes[pair + 1] : NSGridCell.emptyContentView])
+        }
+        let snoozeRow = NSView(); snoozeRow.translatesAutoresizingMaskIntoConstraints = false
+        grid.translatesAutoresizingMaskIntoConstraints = false; snoozeRow.addSubview(grid)
+        NSLayoutConstraint.activate([
+            grid.leadingAnchor.constraint(equalTo: snoozeRow.leadingAnchor, constant: 14), grid.trailingAnchor.constraint(lessThanOrEqualTo: snoozeRow.trailingAnchor, constant: -14),
+            grid.topAnchor.constraint(equalTo: snoozeRow.topAnchor, constant: 11), grid.bottomAnchor.constraint(equalTo: snoozeRow.bottomAnchor, constant: -11)
+        ])
+        let snooze = FormSection(rows: [snoozeRow])
+        let snoozeTitle = sectionHeader("SNOOZE TIMES")
         let generalTitle = sectionHeader("GENERAL"), defaultsTitle = sectionHeader("NEW NOTES")
         let reveal = NSButton(title: "Show Library in Finder", target: self, action: #selector(showLibraryFolder))
         reveal.bezelStyle = .inline; reveal.controlSize = .small
         let version = label("GoodSticky \(Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "")", size: 11, color: tertiaryInk)
         status.lineBreakMode = .byWordWrapping; status.maximumNumberOfLines = 2
-        for view in [generalTitle, general, status, defaultsTitle, defaults, version, reveal] as [NSView] { view.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(view) }
+        for view in [generalTitle, general, status, defaultsTitle, defaults, snoozeTitle, snooze, version, reveal] as [NSView] { view.translatesAutoresizingMaskIntoConstraints = false; root.addSubview(view) }
         NSLayoutConstraint.activate([
             generalTitle.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 30), generalTitle.topAnchor.constraint(equalTo: root.topAnchor, constant: 46),
             general.leadingAnchor.constraint(equalTo: root.leadingAnchor, constant: 20), general.trailingAnchor.constraint(equalTo: root.trailingAnchor, constant: -20), general.topAnchor.constraint(equalTo: generalTitle.bottomAnchor, constant: 6),
             status.leadingAnchor.constraint(equalTo: generalTitle.leadingAnchor), status.trailingAnchor.constraint(equalTo: general.trailingAnchor), status.topAnchor.constraint(equalTo: general.bottomAnchor, constant: 6),
             defaultsTitle.leadingAnchor.constraint(equalTo: generalTitle.leadingAnchor), defaultsTitle.topAnchor.constraint(equalTo: status.bottomAnchor, constant: 4),
             defaults.leadingAnchor.constraint(equalTo: general.leadingAnchor), defaults.trailingAnchor.constraint(equalTo: general.trailingAnchor), defaults.topAnchor.constraint(equalTo: defaultsTitle.bottomAnchor, constant: 6),
-            version.leadingAnchor.constraint(equalTo: generalTitle.leadingAnchor), version.topAnchor.constraint(equalTo: defaults.bottomAnchor, constant: 18),
+            snoozeTitle.leadingAnchor.constraint(equalTo: generalTitle.leadingAnchor), snoozeTitle.topAnchor.constraint(equalTo: defaults.bottomAnchor, constant: 18),
+            snooze.leadingAnchor.constraint(equalTo: general.leadingAnchor), snooze.trailingAnchor.constraint(equalTo: general.trailingAnchor), snooze.topAnchor.constraint(equalTo: snoozeTitle.bottomAnchor, constant: 6),
+            version.leadingAnchor.constraint(equalTo: generalTitle.leadingAnchor), version.topAnchor.constraint(equalTo: snooze.bottomAnchor, constant: 18),
             version.bottomAnchor.constraint(equalTo: root.bottomAnchor, constant: -20),
             reveal.trailingAnchor.constraint(equalTo: general.trailingAnchor, constant: -6), reveal.centerYAnchor.constraint(equalTo: version.centerYAnchor)
         ])
@@ -95,6 +119,10 @@ final class PreferencesController: NSWindowController, NSWindowDelegate {
     @objc func opacityChanged(_ sender: NSSlider) {
         NoteStore.shared.preferences.defaultOpacity = sender.doubleValue
         percentage.stringValue = "\(Int((sender.doubleValue * 100).rounded()))%"; NoteStore.shared.save()
+    }
+    @objc func snoozeChanged() {
+        NoteStore.shared.preferences.snoozeOptions = snoozeBoxes.filter { $0.state == .on }.compactMap { $0.identifier.flatMap { SnoozeOption(rawValue: $0.rawValue) } }
+        NoteStore.shared.save()
     }
     @objc func recordShortcut() { record() }
     @objc func stopRecording() {

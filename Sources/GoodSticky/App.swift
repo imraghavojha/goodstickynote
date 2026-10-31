@@ -66,6 +66,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var refreshing = false
     var waitingToQuit = false
     private var outsideClickMonitor: Any?
+    private var snoozeTimer: Timer?
+    private var scheduledWake: Date?
     var quitProgress: ImportWaitController?
     var replyToTermination: (Bool) -> Void = { NSApp.reply(toApplicationShouldTerminate: $0) }
 
@@ -111,8 +113,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         // Blank notes hidden by an earlier version are cleared before anything is shown.
         if store.discardBlankHidden() { store.save() }
-        store.onChange = { [weak self] in self?.synchronize() }
+        // Snoozes that ended while GoodSticky wasn't running come back at launch.
+        store.wakeSnoozed()
+        store.onChange = { [weak self] in self?.synchronize(); self?.scheduleSnoozeWake() }
         synchronize()
+        scheduleSnoozeWake()
+        // A sleeping Mac delays timers, and clock changes move wall-clock deadlines.
+        NSWorkspace.shared.notificationCenter.addObserver(self, selector: #selector(snoozeClockChanged), name: NSWorkspace.didWakeNotification, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(snoozeClockChanged), name: .NSSystemClockDidChange, object: nil)
+        NotificationCenter.default.addObserver(self, selector: #selector(screensChanged), name: NSApplication.didChangeScreenParametersNotification, object: nil)
         if store.loadFailed || CommandLine.arguments.contains("--show-library") { showLibrary() }
         if CommandLine.arguments.contains("--show-preferences") { showPreferences() }
         if store.loadFailed {
@@ -224,11 +233,49 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let key = note.stackID?.uuidString ?? id.uuidString
         if let widget = widgets[key] { widget.activeID = id; widget.refresh(); widget.show(focus: true) }
     }
-    func bringAllForward() {
+    func bringAllForward() { bringForward(Array(widgets.values)) }
+    /// Raises notes above other apps until the next click elsewhere.
+    func bringForward(_ targets: [WidgetController]) {
         if outsideClickMonitor == nil {
             outsideClickMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in self?.returnNotesToDesktop() }
         }
-        for widget in widgets.values { widget.bringForward() }
+        for widget in targets { widget.bringForward() }
+    }
+    /// One timer, armed for the earliest snooze only. Woken notes come forward so they are seen.
+    func scheduleSnoozeWake() {
+        let woken = store.wakeSnoozed()
+        if !woken.isEmpty {
+            let targets = widgets.values.filter { widget in
+                guard let id = widget.ids.first(where: woken.contains) else { return false }
+                if widget.activeID != id { widget.activeID = id; widget.refresh() }
+                return true
+            }
+            bringForward(targets)
+        }
+        let next = store.nextSnoozeWake
+        guard next != scheduledWake else { return }
+        snoozeTimer?.invalidate(); snoozeTimer = nil; scheduledWake = next
+        guard let next else { return }
+        let timer = Timer(fire: next, interval: 0, repeats: false) { [weak self] _ in self?.scheduledWake = nil; self?.scheduleSnoozeWake() }
+        timer.tolerance = 2
+        RunLoop.main.add(timer, forMode: .common); snoozeTimer = timer
+    }
+    @objc func snoozeClockChanged() { scheduledWake = nil; scheduleSnoozeWake() }
+    @objc func screensChanged() { widgets.values.forEach { $0.screensChanged() } }
+    /// Swiping past the last note: a fresh page joins the stack (or starts one) and takes focus.
+    func appendNote(to widget: WidgetController) {
+        guard !store.loadFailed, let current = widget.note else { return }
+        let stackID = current.stackID ?? UUID()
+        if current.stackID == nil { store.updateMany(widget.ids, notify: false) { $0.stackID = stackID } }
+        var note = StickyNote()
+        note.themeID = current.themeID; note.opacity = current.opacity; note.pinned = current.pinned; note.dock = current.dock
+        note.x = current.x; note.y = current.y; note.width = current.width; note.height = current.height
+        note.stackID = stackID
+        store.insert(note)
+        synchronize()
+        guard let stack = widgets[stackID.uuidString] else { return }
+        stack.select(note.id, direction: 1)
+        stack.show(focus: true)
     }
     func returnNotesToDesktop() {
         if let monitor = outsideClickMonitor { NSEvent.removeMonitor(monitor); outsideClickMonitor = nil }
@@ -244,7 +291,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         guard let note = store.note(id), let other = store.note(otherID) else { return }
         let stackID = other.stackID ?? UUID()
         let ids = store.notes.filter { $0.id == id || $0.id == otherID || (note.stackID != nil && $0.stackID == note.stackID) || (other.stackID != nil && $0.stackID == other.stackID) }.map(\.id)
-        store.updateMany(ids, notify: false) { $0.stackID = stackID; $0.x = other.x; $0.y = other.y; $0.width = other.width; $0.height = other.height; $0.pinned = other.pinned }
+        store.updateMany(ids, notify: false) { $0.stackID = stackID; $0.x = other.x; $0.y = other.y; $0.width = other.width; $0.height = other.height; $0.pinned = other.pinned; $0.dock = other.dock }
         synchronize()
         widgets[stackID.uuidString]?.activeID = id; widgets[stackID.uuidString]?.refresh()
         widgets[stackID.uuidString]?.show(focus: true)
@@ -256,7 +303,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
     func unstack(_ id: UUID) {
         guard let note = store.note(id) else { return }
-        store.update(id, notify: false) { $0.stackID = nil; $0.x += 24; $0.y -= 24 }
+        // A note taken out of a side-note stack lands on the desktop beside the edge.
+        store.update(id, notify: false) { $0.stackID = nil; $0.x += note.dockEdge == .right ? -$0.width - 24 : note.dockEdge == .left ? $0.width + 24 : 24; $0.y -= 24; $0.dock = nil }
         if let stack = note.stackID {
             let remaining = store.notes.filter { $0.stackID == stack }
             if remaining.count == 1 { store.update(remaining[0].id, notify: false) { $0.stackID = nil } }

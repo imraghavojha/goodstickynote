@@ -1,7 +1,7 @@
 import AppKit
 
 extension AppDelegate {
-    func checkUndoHistory() {
+    func checkUndoHistory(completion: @escaping () -> Void) {
         func check(_ value: @autoclosure () -> Bool, _ message: String) {
             if !value() { print("FAIL: " + message); fflush(stdout); fatalError(message) }; print("PASS: " + message); fflush(stdout)
         }
@@ -25,9 +25,6 @@ extension AppDelegate {
 
         }
         check(widget.textView == nil, "Idle note releases its editor")
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak releasedEditor] in
-            check(releasedEditor == nil, "History retains no editor after AppKit drains its event")
-        }
         widget.window?.makeKeyAndOrderFront(nil)
         widget.window?.makeFirstResponder(widget.window)
         let undoSent = NSApp.sendAction(Selector(("undo:")), to: nil, from: nil)
@@ -82,8 +79,12 @@ extension AppDelegate {
         editor = nil
         store.delete(item.id); store.delete(other.id)
         widget = widgets.values.first!
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak releasedHistory] in
+        // Finish these lifetime assertions from the top-level event loop before any
+        // subsequent smoke checks spin nested run loops and hold AppKit autoreleases.
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak releasedEditor, weak releasedHistory] in
+            check(releasedEditor == nil, "History retains no editor after AppKit drains its event")
             check(releasedHistory == nil, "Deleting a note releases its history")
+            completion()
         }
     }
 }

@@ -59,6 +59,56 @@ final class WidgetSurface: NSView {
     }
 }
 
+/// The sliver a side note leaves at the screen edge. Hovering or clicking it slides the note
+/// out. It is a tiny layer-backed panel: no bitmap beyond its few points of paper.
+final class DockTab: NSPanel {
+    static let size = NSSize(width: 6, height: 54)
+    let tabView = DockTabView(frame: NSRect(origin: .zero, size: DockTab.size))
+    init() {
+        super.init(contentRect: NSRect(origin: .zero, size: Self.size), styleMask: [.borderless, .nonactivatingPanel], backing: .buffered, defer: true)
+        isOpaque = false; backgroundColor = .clear; hasShadow = false
+        hidesOnDeactivate = false; isReleasedWhenClosed = false; animationBehavior = .none
+        collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
+        level = .floating
+        contentView = tabView
+    }
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
+}
+
+final class DockTabView: NSView {
+    var paper = NSColor.yellow { didSet { needsDisplay = true } }
+    var ink = NSColor.black { didSet { needsDisplay = true } }
+    var edge = DockEdge.right { didSet { needsDisplay = true } }
+    var onOpen: ((Bool) -> Void)?
+    private var tracking: NSTrackingArea?
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true; layerContentsRedrawPolicy = .onSetNeedsDisplay
+        setAccessibilityElement(true); setAccessibilityRole(.button)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        guard let layer else { return }
+        layer.backgroundColor = paper.cgColor
+        layer.cornerRadius = 3; layer.cornerCurve = .continuous
+        // Only the corners facing the screen are rounded; the other side meets the edge.
+        layer.maskedCorners = edge == .right ? [.layerMinXMinYCorner, .layerMinXMaxYCorner] : [.layerMaxXMinYCorner, .layerMaxXMaxYCorner]
+        layer.borderColor = ink.withAlphaComponent(0.22).cgColor; layer.borderWidth = 0.5
+    }
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let tracking { removeTrackingArea(tracking) }
+        tracking = NSTrackingArea(rect: bounds, options: [.activeAlways, .mouseEnteredAndExited, .inVisibleRect], owner: self)
+        addTrackingArea(tracking!)
+    }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func mouseEntered(with event: NSEvent) { onOpen?(false) }
+    override func mouseDown(with event: NSEvent) { onOpen?(true) }
+    override func accessibilityPerformPress() -> Bool { onOpen?(true); return true }
+}
+
 /// Small vector marks rendered by the window server instead of per-view bitmaps.
 class ShapeMarkView: NSView {
     let shape = CAShapeLayer()
@@ -94,6 +144,7 @@ final class DragHandle: ShapeMarkView {
         return path
     }
     /// Screen-space cursor location while moving, and when released.
+    var onBegin: (() -> Void)?
     var onMove: ((NSPoint) -> Void)?
     var onRelease: ((NSPoint) -> Void)?
     private var start: NSPoint?
@@ -104,6 +155,7 @@ final class DragHandle: ShapeMarkView {
         guard let window else { return }
         start = NSEvent.mouseLocation; origin = window.frame.origin
         NSCursor.closedHand.push()
+        onBegin?()
     }
     override func mouseDragged(with event: NSEvent) {
         guard let window, let start else { return }

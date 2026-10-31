@@ -117,6 +117,35 @@ import AppKit
         check(blankStore.note(blankStack.id) == nil && blankStore.note(partner.id)?.hidden == true && blankStore.note(withFile.id) != nil, "Hidden blank notes are discarded; notes with text or files are kept")
         check(blankStore.note(partner.id)?.stackID == nil, "Discarding a blank note dissolves a stack of one")
         try blankStore.flush()
+        // Side notes and snoozes persist; libraries written before they existed still load.
+        let featureStore = NoteStore(directory: directory.appendingPathComponent("Features"))
+        var docked = StickyNote(); docked.text = "Side"; docked.dock = "right"
+        var napping = StickyNote(); napping.text = "Later"; napping.hidden = true; napping.snoozedUntil = Date(timeIntervalSince1970: 2_000_000_000)
+        featureStore.notes = [docked, napping]; featureStore.preferences.snoozeOptions = [.nextWeek, .oneHour]
+        try featureStore.flush()
+        let reloaded = NoteStore(directory: featureStore.directory)
+        check(reloaded.notes == [docked, napping] && reloaded.note(docked.id)?.dockEdge == .right, "Side-note edge and snooze time round-trip")
+        check(reloaded.preferences.snoozeOptions == [.oneHour, .nextWeek], "Chosen snooze times persist in menu order")
+        check(Preferences().snoozeOptions == [.tomorrowMorning, .evening, .twelveHours, .nextWeek], "Default snooze times: next morning, evening, 12 hours, next week")
+        let legacy = #"{"notes":[{"id":"6F1B7A10-0C55-4E58-9D5E-2E7B8F0E9A11","text":"Old","themeID":"butter","opacity":1,"x":0,"y":0,"width":220,"height":180,"hidden":false,"pinned":false,"attachments":[],"created":0,"modified":0}],"preferences":{"keyCode":45,"modifiers":6144,"defaultTheme":"butter","defaultOpacity":1}}"#
+        let legacyState = try JSONDecoder().decode(SavedState.self, from: Data(legacy.utf8))
+        check(legacyState.notes.first?.dock == nil && legacyState.notes.first?.snoozedUntil == nil && legacyState.preferences.snoozeOptions == SnoozeOption.defaults, "Libraries from earlier versions load with no side notes or snoozes")
+        check(reloaded.nextSnoozeWake == napping.snoozedUntil && reloaded.wakeSnoozed(at: Date(timeIntervalSince1970: 1_000_000_000)).isEmpty, "A pending snooze stays hidden")
+        check(reloaded.wakeSnoozed(at: Date(timeIntervalSince1970: 2_000_000_001)) == [napping.id] && reloaded.note(napping.id)?.hidden == false && reloaded.note(napping.id)?.snoozedUntil == nil, "An ended snooze returns the note to the desktop")
+        reloaded.update(napping.id) { $0.hidden = true; $0.snoozedUntil = Date(timeIntervalSince1970: 2_000_000_000) }
+        reloaded.update(napping.id) { $0.hidden = false }
+        check(reloaded.note(napping.id)?.snoozedUntil == nil && reloaded.nextSnoozeWake == nil, "Showing a snoozed note by hand cancels its snooze")
+        var calendar = Calendar(identifier: .gregorian); calendar.timeZone = TimeZone(identifier: "America/New_York")!
+        func at(_ y: Int, _ m: Int, _ d: Int, _ h: Int, _ min: Int = 0) -> Date { calendar.date(from: DateComponents(year: y, month: m, day: d, hour: h, minute: min))! }
+        let friday = at(2026, 10, 30, 14, 30) // Friday afternoon
+        check(SnoozeOption.tomorrowMorning.date(from: friday, calendar: calendar) == at(2026, 10, 31, 9), "Next morning is tomorrow at 9 AM")
+        check(SnoozeOption.tomorrowMorning.date(from: at(2026, 10, 30, 2), calendar: calendar) == at(2026, 10, 30, 9), "In the small hours, next morning is the coming 9 AM")
+        check(SnoozeOption.evening.date(from: friday, calendar: calendar) == at(2026, 10, 30, 21) && SnoozeOption.evening.title(from: friday, calendar: calendar) == "This evening", "Evening is tonight at 9 PM before 8 PM")
+        check(SnoozeOption.evening.date(from: at(2026, 10, 30, 20, 30), calendar: calendar) == at(2026, 10, 31, 21), "Late evening snoozes to tomorrow at 9 PM")
+        check(SnoozeOption.twelveHours.date(from: friday, calendar: calendar) == friday.addingTimeInterval(43_200), "12 hours from now")
+        check(SnoozeOption.nextWeek.date(from: friday, calendar: calendar) == at(2026, 11, 2, 9), "Next week is Monday at 9 AM")
+        check(SnoozeOption.nextWeek.date(from: at(2026, 11, 2, 7), calendar: calendar) == at(2026, 11, 9, 9), "On a Monday, next week is the following Monday")
+        check(SnoozeOption.weekend.date(from: friday, calendar: calendar) == at(2026, 10, 31, 9), "This weekend is Saturday at 9 AM")
         let file = directory.appendingPathComponent("notes.json")
         let original = Data("not valid JSON".utf8); try original.write(to: file)
         let broken = NoteStore(directory: directory)
