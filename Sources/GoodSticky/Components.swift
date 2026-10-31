@@ -31,7 +31,7 @@ class ActionButton: NSButton {
     init(_ title: String = "", symbol: String? = nil, action: @escaping () -> Void) {
         super.init(frame: .zero)
         self.title = title
-        if let symbol { image = NSImage(systemSymbolName: symbol, accessibilityDescription: title) }
+        if let symbol { image = sharedSymbol(symbol) }
         self.actionHandler = action
         self.target = self
         self.action = #selector(invoke)
@@ -124,8 +124,48 @@ final class ImportWaitController: NSWindowController {
     required init?(coder: NSCoder) { fatalError() }
 }
 
+/// GoodSticky never shows a menu bar, so it installs no main menu: assigning one makes AppKit
+/// scan and customize it (Dictation, Emoji & Symbols…), which was most of the launch CPU.
+/// Every GoodSticky window routes the standard shortcuts through here instead.
+enum KeyCommands {
+    static func perform(_ event: NSEvent) -> Bool {
+        let flags = event.modifierFlags.intersection([.command, .shift, .option, .control])
+        // ⌃⌘Space: Emoji & Symbols, which AppKit normally adds to an Edit menu.
+        if flags == [.command, .control], event.keyCode == 49 { NSApp.orderFrontCharacterPalette(nil); return true }
+        guard flags.contains(.command), flags.isDisjoint(with: [.control, .option]) else { return false }
+        let shift = flags.contains(.shift)
+        func send(_ action: Selector) -> Bool { NSApp.sendAction(action, to: nil, from: nil) }
+        switch (event.charactersIgnoringModifiers?.lowercased() ?? "", shift) {
+        case ("c", false): return send(#selector(NSText.copy(_:)))
+        case ("x", false): return send(#selector(NSText.cut(_:)))
+        case ("v", false): return send(#selector(NSText.paste(_:)))
+        case ("a", false): return send(#selector(NSText.selectAll(_:)))
+        case ("z", false): return send(Selector(("undo:")))
+        case ("z", true): return send(Selector(("redo:")))
+        case ("w", false): AppDelegate.shared.closeFrontmost(); return true
+        case ("n", false): AppDelegate.shared.createNote(); return true
+        case (",", false): AppDelegate.shared.showPreferences(); return true
+        case ("q", false): NSApp.terminate(nil); return true
+        default: return false
+        }
+    }
+}
+
+/// SF Symbols are parsed and rasterized once per name and configuration, then shared by
+/// every button and menu item: each NSImage instance would otherwise re-run CoreSVG.
+/// Buttons and menu items carry their own accessibility labels.
+private var symbolCache: [String: NSImage] = [:]
 func symbol(_ name: String, size: CGFloat = 13, weight: NSFont.Weight = .medium, description: String? = nil) -> NSImage? {
-    NSImage(systemSymbolName: name, accessibilityDescription: description)?.withSymbolConfiguration(.init(pointSize: size, weight: weight))
+    let key = "\(name)|\(size)|\(weight.rawValue)"
+    if let cached = symbolCache[key] { return cached }
+    let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)?.withSymbolConfiguration(.init(pointSize: size, weight: weight))
+    symbolCache[key] = image; return image
+}
+/// An unconfigured shared symbol (AppKit's default size for the control's font).
+func sharedSymbol(_ name: String) -> NSImage? {
+    if let cached = symbolCache[name] { return cached }
+    let image = NSImage(systemSymbolName: name, accessibilityDescription: nil)
+    symbolCache[name] = image; return image
 }
 
 /// Borderless icon button with a soft rounded hover/press background, like toolbar buttons.

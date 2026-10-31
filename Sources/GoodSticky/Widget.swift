@@ -5,6 +5,7 @@ import UniformTypeIdentifiers
 final class StickyPanel: NSPanel {
     override var canBecomeKey: Bool { true }
     override var canBecomeMain: Bool { false }
+    override func performKeyEquivalent(with event: NSEvent) -> Bool { super.performKeyEquivalent(with: event) || KeyCommands.perform(event) }
 }
 
 /// The paper is drawn entirely with layer properties, so a note owns no full-size bitmap.
@@ -182,35 +183,47 @@ final class PageDots: NSView {
 
 /// Turns a horizontal two-finger trackpad swipe (or a horizontal wheel flick) into one
 /// switch per gesture, like back/forward in a browser. Vertical scrolling is untouched.
-final class NoteScrollView: NSScrollView {
-    var canSwipe: () -> Bool = { false }
+final class SwipeTracker {
+    enum Result { case swipe, undecided, other }
     var onSwipe: ((Int) -> Void)?
     private var horizontal: Bool?
     private var travel: CGFloat = 0
     private var fired = false
     private var lastDiscrete = Date.distantPast
     static let threshold: CGFloat = 56
-    override func scrollWheel(with event: NSEvent) {
-        guard canSwipe() else { super.scrollWheel(with: event); return }
+    func handle(_ event: NSEvent) -> Result {
         // Physical finger direction, independent of the natural-scrolling setting.
         let dx = event.isDirectionInvertedFromDevice ? event.scrollingDeltaX : -event.scrollingDeltaX
         if !event.hasPreciseScrollingDeltas {
-            guard abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY), event.scrollingDeltaX != 0 else { super.scrollWheel(with: event); return }
+            guard abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY), event.scrollingDeltaX != 0 else { return .other }
             if Date().timeIntervalSince(lastDiscrete) > 0.4 { lastDiscrete = Date(); onSwipe?(dx > 0 ? -1 : 1) }
-            return
+            return .swipe
         }
         if event.phase.contains(.began) || event.phase.contains(.mayBegin) { horizontal = nil; travel = 0; fired = false }
-        if event.momentumPhase.isEmpty && !event.phase.isEmpty && horizontal == nil {
+        let tracking = event.momentumPhase.isEmpty && !event.phase.isEmpty
+        if tracking && horizontal == nil {
             let x = abs(event.scrollingDeltaX), y = abs(event.scrollingDeltaY)
             if x + y > 0.5 { horizontal = x > y * 1.3 }
         }
-        guard horizontal == true else { super.scrollWheel(with: event); return }
-        // Horizontal gestures, including their momentum tail, never reach the text view.
+        guard let horizontal else { return tracking ? .undecided : .other }
+        guard horizontal else { return .other }
+        // Horizontal gestures, including their momentum tail, never reach the text.
         if event.momentumPhase.isEmpty {
             travel += dx
             if !fired && abs(travel) >= Self.threshold { fired = true; onSwipe?(travel > 0 ? -1 : 1) }
         }
-        if event.momentumPhase.contains(.ended) || event.momentumPhase.contains(.cancelled) || (event.momentumPhase.isEmpty && (event.phase.contains(.cancelled))) { horizontal = nil }
+        if event.momentumPhase.contains(.ended) || event.momentumPhase.contains(.cancelled) || (event.momentumPhase.isEmpty && event.phase.contains(.cancelled)) { self.horizontal = nil }
+        return .swipe
+    }
+}
+
+final class NoteScrollView: NSScrollView {
+    var canSwipe: () -> Bool = { false }
+    let swipe = SwipeTracker()
+    var onSwipe: ((Int) -> Void)? { get { swipe.onSwipe } set { swipe.onSwipe = newValue } }
+    override func scrollWheel(with event: NSEvent) {
+        if canSwipe(), swipe.handle(event) == .swipe { return }
+        super.scrollWheel(with: event)
     }
 }
 
@@ -306,13 +319,112 @@ final class ResizeGrip: ShapeMarkView {
 
 }
 
+/// One text style shared by the idle display and the editor, so swapping them never shifts text.
+enum NoteText {
+    static let font = NSFont.systemFont(ofSize: 13)
+    static let paragraph: NSParagraphStyle = { let style = NSMutableParagraphStyle(); style.lineSpacing = 2; return style }()
+    /// NSTextView defaults: 5 pt line-fragment padding; GoodSticky uses a 1 pt top inset.
+    static let padding: CGFloat = 5, inset: CGFloat = 1
+    static func attributes(_ ink: NSColor) -> [NSAttributedString.Key: Any] { [.font: font, .foregroundColor: ink, .paragraphStyle: paragraph] }
+}
+
+/// What an idle note shows instead of a text view: one layer whose bitmap covers only the
+/// lines of text, and no text-system objects at all. Clicking, scrolling or focusing it
+/// creates the real editor in place (see `WidgetController.beginEditing`).
+final class NoteTextDisplay: NSView, CALayerDelegate {
+    var text = "" { didSet { if oldValue != text { measured = nil; setAccessibilityValue(text); needsLayout = true; ink.setNeedsDisplay() } } }
+    var color = NSColor.black { didSet { if oldValue != color { ink.setNeedsDisplay() } } }
+    /// Scroll position carried over from the editor, so ending an edit never jumps.
+    var offset: CGFloat = 0 { didSet { if oldValue != offset { needsLayout = true; ink.setNeedsDisplay() } } }
+    var onActivate: ((NSEvent?) -> Void)?
+    /// Vertical scroll events for the editor, oldest first (a held gesture start included).
+    var onScroll: (([NSEvent]) -> Void)?
+    var canSwipe: () -> Bool = { false }
+    let swipe = SwipeTracker()
+    private var heldBegan: NSEvent?
+    private let ink = CALayer()
+    private var measured: (width: CGFloat, height: CGFloat)?
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        ink.delegate = self; ink.anchorPoint = .zero; ink.needsDisplayOnBoundsChange = true
+        ink.actions = ["bounds": NSNull(), "position": NSNull(), "contents": NSNull()]
+        layer?.addSublayer(ink)
+        setAccessibilityElement(true); setAccessibilityRole(.textArea); setAccessibilityLabel("Note text")
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    private func height(at width: CGFloat) -> CGFloat {
+        text.isEmpty ? 0 : ceil(NSAttributedString(string: text, attributes: NoteText.attributes(color)).boundingRect(with: NSSize(width: max(1, width - NoteText.padding * 2), height: .greatestFiniteMagnitude), options: [.usesLineFragmentOrigin]).height) + NoteText.inset + 2
+    }
+    /// Width the editor would give the text: with "always show scroll bars", an overflowing
+    /// note loses the scroller's width, so the display wraps exactly as the editor will.
+    private(set) var textWidth: CGFloat = 0
+    /// Height of the laid-out text, cached per text and width.
+    var textHeight: CGFloat {
+        if let measured, measured.width == bounds.width { return measured.height }
+        var width = bounds.width, height = height(at: width)
+        if height > bounds.height + 0.5, NSScroller.preferredScrollerStyle == .legacy {
+            width -= NSScroller.scrollerWidth(for: .regular, scrollerStyle: .legacy); height = self.height(at: width)
+        }
+        textWidth = width; measured = (bounds.width, height); return height
+    }
+    var overflows: Bool { textHeight > bounds.height + 0.5 }
+    override func layout() {
+        super.layout()
+        // The bitmap is only as tall as the visible text, not the whole note.
+        let height = min(bounds.height, max(0, textHeight - offset))
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        ink.frame = CGRect(x: 0, y: bounds.height - height, width: bounds.width, height: height)
+        ink.contentsScale = window?.backingScaleFactor ?? 2
+        CATransaction.commit()
+    }
+    override func setFrameSize(_ newSize: NSSize) { super.setFrameSize(newSize); needsLayout = true }
+    override func viewDidChangeBackingProperties() { super.viewDidChangeBackingProperties(); needsLayout = true; ink.setNeedsDisplay() }
+    func draw(_ layer: CALayer, in context: CGContext) {
+        guard !text.isEmpty else { return }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(cgContext: context, flipped: true)
+        context.translateBy(x: 0, y: layer.bounds.height); context.scaleBy(x: 1, y: -1)
+        NSAttributedString(string: text, attributes: NoteText.attributes(color)).draw(
+            with: NSRect(x: NoteText.padding, y: NoteText.inset - offset, width: max(1, (textHeight > 0 ? textWidth : bounds.width) - NoteText.padding * 2), height: .greatestFiniteMagnitude),
+            options: [.usesLineFragmentOrigin])
+        NSGraphicsContext.restoreGraphicsState()
+    }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .iBeam) }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override var needsPanelToBecomeKey: Bool { true }
+    // Not a first responder: AppKit would otherwise pick it as every window's initial
+    // responder and build an editor for each note at launch.
+    override var acceptsFirstResponder: Bool { false }
+    override func mouseDown(with event: NSEvent) { onActivate?(event) }
+    /// Stack swipes are recognized here, so an idle note never builds an editor to swipe.
+    override func scrollWheel(with event: NSEvent) {
+        if canSwipe() {
+            switch swipe.handle(event) {
+            case .swipe: heldBegan = nil; return
+            case .undecided: if heldBegan == nil { heldBegan = event }; return
+            case .other: break
+            }
+        }
+        let events = heldBegan.map { [$0, event] } ?? [event]
+        heldBegan = nil
+        onScroll?(events)
+    }
+    override func accessibilityPerformPress() -> Bool { onActivate?(nil); return true }
+}
+
 final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDelegate, NSPopoverDelegate {
     let store = NoteStore.shared
     var ids: [UUID]
-    var activeID: UUID { didSet { if oldValue != activeID { textView.undoManager?.removeAllActions() } } }
+    var activeID: UUID { didSet { if oldValue != activeID { textView?.undoManager?.removeAllActions() } } }
     let surface = WidgetSurface(frame: .zero)
-    let textView = NoteTextView(frame: .zero)
-    let scroll = NoteScrollView()
+    let display = NoteTextDisplay(frame: .zero)
+    /// The editor exists only while a note is being edited, scrolled or recently used.
+    private(set) var textView: NoteTextView?
+    private(set) var scroll: NoteScrollView?
+    private var endEditingWork: DispatchWorkItem?
+    /// Seconds an unfocused editor lingers (keeping undo) before reverting to the display.
+    static var editorLinger: TimeInterval = 20
     let handle = DragHandle()
     /// Hover controls are built on first hover/focus; most desktop notes never need them.
     private(set) var controls: FrameStack?
@@ -328,6 +440,7 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
     private var failedPreviewIDs = Set<UUID>()
     private var importsInProgress = 0
     private weak var stackTarget: WidgetController?
+    private var moving = false
     private var configuring = false
     private var layingOut = false
     private var transientFront = false
@@ -343,6 +456,10 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         panel.delegate = self
         panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false
         panel.hidesOnDeactivate = false; panel.isReleasedWhenClosed = false
+        // AppKit's own window fade steps an NSAnimation on the display link, in this process,
+        // every frame for every note (nearly half of launch CPU with ten notes). Notes fade
+        // with a Core Animation opacity animation instead, which the render server runs.
+        panel.animationBehavior = .none
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         panel.minSize = NSSize(width: 140, height: 96)
         panel.contentView = surface
@@ -359,44 +476,120 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
     required init?(coder: NSCoder) { fatalError() }
     func setup() {
         surface.addSubview(handle); handle.toolTip = "Drag to move · drop on another note to stack"
-        handle.onMove = { [weak self] point in self?.trackStackTarget(at: point) }
-        handle.onRelease = { [weak self] point in self?.finishMove(at: point) }
-        scroll.drawsBackground = false; scroll.borderType = .noBorder
-        scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
-        textView.allowsUndo = true; textView.isRichText = false; textView.drawsBackground = false
-        textView.font = .systemFont(ofSize: 13)
-        textView.textContainerInset = NSSize(width: 0, height: 1)
-        textView.isVerticallyResizable = true; textView.isHorizontallyResizable = false
-        textView.autoresizingMask = [.width]; textView.textContainer?.widthTracksTextView = true
-        textView.isAutomaticSpellingCorrectionEnabled = false; textView.delegate = self
-        // Text checking services load lazily, only while a note is being edited.
-        setEditingServices(false)
-        textView.onFiles = { [weak self] in self?.addFiles($0) }
-        textView.onCycle = { [weak self] direction in self?.cycle(direction) }
-        scroll.canSwipe = { [weak self] in (self?.ids.count ?? 0) > 1 }
-        scroll.onSwipe = { [weak self] direction in self?.cycle(direction) }
+        handle.onMove = { [weak self] point in self?.moving = true; self?.trackStackTarget(at: point) }
+        handle.onRelease = { [weak self] point in
+            // A drag saves its final position once, not on every mouse event.
+            self?.moving = false; self?.saveFrame(); self?.finishMove(at: point)
+        }
+        display.onActivate = { [weak self] event in self?.activate(with: event) }
+        display.onScroll = { [weak self] events in self?.scrollIdle(events) }
+        display.canSwipe = { [weak self] in (self?.ids.count ?? 0) > 1 }
+        display.swipe.onSwipe = { [weak self] direction in self?.cycle(direction) }
         surface.onSwipe = { [weak self] direction in self?.cycle(direction) }
         dots.onSelect = { [weak self] index in
             guard let self, self.ids.indices.contains(index) else { return }
             self.select(self.ids[index])
         }
-        scroll.documentView = textView; surface.addSubview(scroll)
+        surface.addSubview(display)
         surface.addSubview(attachments); surface.addSubview(dots); surface.addSubview(grip)
         surface.onHover = { [weak self] hovering in
             guard let self else { return }
-            self.hovering = hovering; self.updateControlsVisibility()
+            self.hovering = hovering; self.updateControlsVisibility(); self.scheduleEndEditing()
         }
         surface.onDrop = { [weak self] in self?.addFiles($0) }
         surface.onLayout = { [weak self] in self?.layoutNote() }
+    }
+    /// A click, scroll or focus on the idle display. Plain vertical scrolling of text that
+    /// fits needs no editor, so it is ignored, exactly as an editor would ignore it.
+    func activate(with event: NSEvent?) { beginEditing(event) }
+    /// Vertical scrolling of an idle note: only text that overflows needs the editor.
+    func scrollIdle(_ events: [NSEvent]) {
+        guard display.overflows || display.offset > 0, let first = events.first else { return }
+        beginEditing(first)
+        for event in events.dropFirst() { scroll?.scrollWheel(with: event) }
+    }
+    /// Creates the editor over the display and forwards the triggering event to it, so the
+    /// caret, selection drag or scroll happens exactly where the user acted.
+    @discardableResult func beginEditing(_ event: NSEvent? = nil) -> NoteTextView {
+        endEditingWork?.cancel(); endEditingWork = nil
+        let textView: NoteTextView, scroll: NoteScrollView
+        if let existing = self.textView, let existingScroll = self.scroll { textView = existing; scroll = existingScroll }
+        else {
+            scroll = NoteScrollView(frame: display.frame)
+            scroll.drawsBackground = false; scroll.borderType = .noBorder
+            scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
+            textView = NoteTextView(frame: NSRect(origin: .zero, size: scroll.contentSize))
+            textView.allowsUndo = true; textView.isRichText = false; textView.drawsBackground = false
+            textView.font = NoteText.font
+            textView.textContainerInset = NSSize(width: 0, height: NoteText.inset)
+            textView.isVerticallyResizable = true; textView.isHorizontallyResizable = false
+            textView.autoresizingMask = [.width]; textView.textContainer?.widthTracksTextView = true
+            textView.isAutomaticSpellingCorrectionEnabled = false
+            textView.isContinuousSpellCheckingEnabled = false
+            textView.onFiles = { [weak self] in self?.addFiles($0) }
+            textView.onCycle = { [weak self] direction in self?.cycle(direction) }
+            scroll.canSwipe = { [weak self] in (self?.ids.count ?? 0) > 1 }
+            scroll.onSwipe = { [weak self] direction in self?.cycle(direction) }
+            scroll.documentView = textView
+            self.textView = textView; self.scroll = scroll
+            loadEditor()
+            textView.delegate = self
+            surface.addSubview(scroll, positioned: .above, relativeTo: display)
+            scroll.layoutSubtreeIfNeeded()
+            if display.offset > 0 { scroll.contentView.scroll(to: NSPoint(x: 0, y: display.offset)); scroll.reflectScrolledClipView(scroll.contentView) }
+            display.isHidden = true
+            setEditingServices(window?.isKeyWindow == true)
+        }
+        switch event?.type {
+        case .leftMouseDown?, .rightMouseDown?:
+            window?.makeFirstResponder(textView); textView.mouseDown(with: event!)
+        case .scrollWheel?:
+            scroll.scrollWheel(with: event!); scheduleEndEditing()
+        default:
+            if window?.isKeyWindow == true { window?.makeFirstResponder(textView) }
+        }
+        return textView
+    }
+    /// Copies the active note into the editor with the shared style.
+    private func loadEditor() {
+        guard let textView, let note else { return }
+        textView.textColor = note.theme.ink; textView.insertionPointColor = note.theme.ink
+        textView.defaultParagraphStyle = NoteText.paragraph
+        textView.typingAttributes = NoteText.attributes(note.theme.ink)
+        if textView.string != note.text || textView.textStorage?.length == 0 {
+            textView.textStorage?.setAttributedString(NSAttributedString(string: note.text, attributes: NoteText.attributes(note.theme.ink)))
+        } else {
+            textView.textStorage?.setAttributes(NoteText.attributes(note.theme.ink), range: NSRange(location: 0, length: textView.textStorage?.length ?? 0))
+        }
+    }
+    /// Unfocused, unhovered editors return to the display after a short linger.
+    func scheduleEndEditing() {
+        endEditingWork?.cancel(); endEditingWork = nil
+        guard textView != nil, window?.isKeyWindow != true, !hovering else { return }
+        let work = DispatchWorkItem { [weak self] in self?.endEditing() }
+        endEditingWork = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + Self.editorLinger, execute: work)
+    }
+    func endEditing() {
+        endEditingWork?.cancel(); endEditingWork = nil
+        guard let textView, let scroll, window?.isKeyWindow != true, window?.attachedSheet == nil else { return }
+        display.offset = max(0, scroll.contentView.bounds.origin.y)
+        display.text = textView.string
+        textView.undoManager?.removeAllActions()
+        if window?.firstResponder === textView { window?.makeFirstResponder(nil) }
+        textView.delegate = nil
+        scroll.removeFromSuperview()
+        self.textView = nil; self.scroll = nil
+        display.isHidden = false
     }
     @discardableResult func ensureControls() -> FrameStack {
         if let controls { return controls }
         let copy = ActionButton("Copy note", symbol: "doc.on.doc") { [weak self] in
             guard let self, let note = self.note else { return }
             NSPasteboard.general.clearContents(); NSPasteboard.general.setString(note.text, forType: .string)
-            self.copyButton?.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: "Copied")
+            self.copyButton?.image = sharedSymbol("checkmark")
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-                self?.copyButton?.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Copy note")
+                self?.copyButton?.image = sharedSymbol("doc.on.doc")
             }
         }
         let hide = ActionButton("Hide note", symbol: "minus") { [weak self] in
@@ -427,7 +620,7 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
     }
     func setEditingServices(_ editing: Bool) {
         // Idle desktop notes skip spelling markers, so the spell checker never loads until someone edits.
-        guard textView.isContinuousSpellCheckingEnabled != editing else { return }
+        guard let textView, textView.isContinuousSpellCheckingEnabled != editing else { return }
         textView.isContinuousSpellCheckingEnabled = editing
     }
     /// Switches the visible note in a stack, sliding in the direction of travel.
@@ -457,7 +650,12 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         if number == window.windowNumber { number = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: number) }
         return AppDelegate.shared.widgets.values.first { $0 !== self && $0.window?.windowNumber == number && $0.window?.isVisible == true }
     }
+    private var lastProbe = (point: NSPoint(x: -1e6, y: -1e6), time: 0.0)
     func trackStackTarget(at point: NSPoint) {
+        // Hit-testing asks WindowServer; during a drag, probe again only after a real move.
+        let now = ProcessInfo.processInfo.systemUptime
+        guard hypot(point.x - lastProbe.point.x, point.y - lastProbe.point.y) >= 6 || now - lastProbe.time >= 0.05 else { return }
+        lastProbe = (point, now)
         let candidate = stackCandidate(at: point)
         guard candidate !== stackTarget else { return }
         stackTarget?.surface.stackTarget = false
@@ -475,11 +673,9 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         lastRenderedNote = note; configuring = true
         window?.title = note.title
         surface.theme = note.theme; surface.paperOpacity = note.opacity
-        textView.textColor = note.theme.ink; textView.insertionPointColor = note.theme.ink
-        if textView.string != note.text { textView.string = note.text }
-        let paragraph = NSMutableParagraphStyle(); paragraph.lineSpacing = 2
-        textView.defaultParagraphStyle = paragraph
-        textView.typingAttributes = [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: note.theme.ink, .paragraphStyle: paragraph]
+        if display.text != note.text { display.text = note.text; display.offset = 0 }
+        display.color = note.theme.ink
+        loadEditor()
         handle.tint = note.theme.ink
         grip.tint = note.theme.ink
         if dots.tint != note.theme.ink { dots.tint = note.theme.ink }
@@ -518,9 +714,10 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         attachments.isHidden = attachmentHeight == 0
         attachments.frame = NSRect(x: 12, y: bottom, width: max(0, width - 24), height: attachmentHeight)
         if attachmentHeight > 0 { bottom += attachmentHeight + 6 }
-        scroll.frame = NSRect(x: 10, y: bottom, width: max(0, width - 20), height: max(20, height - 28 - bottom))
+        display.frame = NSRect(x: 10, y: bottom, width: max(0, width - 20), height: max(20, height - 28 - bottom))
+        scroll?.frame = display.frame
     }
-    override func close() { importSpinner?.stopAnimation(nil); appearancePopover?.close(); super.close() }
+    override func close() { importSpinner?.stopAnimation(nil); appearancePopover?.close(); endEditingWork?.cancel(); super.close() }
     func updateMembers(_ members: [UUID]) {
         let sameEditor = members.contains(activeID)
         ids = members
@@ -537,20 +734,47 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         window?.level = note.pinned ? .floating : NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
     }
     func show(focus: Bool = false) {
+        if window?.isVisible != true { fade(in: true) }
         if focus {
             transientFront = true; window?.level = .floating
-            window?.makeKeyAndOrderFront(nil); window?.makeFirstResponder(textView)
+            window?.makeKeyAndOrderFront(nil); window?.makeFirstResponder(beginEditing())
         } else { window?.orderFrontRegardless() }
+    }
+    static let fadeDuration: CFTimeInterval = 0.2
+    /// Appear/disappear fade, committed once and interpolated by the render server: the app
+    /// does no per-frame work, unlike AppKit's NSAnimation-driven window fade.
+    private func fade(in appearing: Bool, completion: (() -> Void)? = nil) {
+        guard let layer = surface.layer else { completion?(); return }
+        CATransaction.begin()
+        CATransaction.setCompletionBlock(completion)
+        let animation = CABasicAnimation(keyPath: "opacity")
+        animation.fromValue = appearing ? 0 : (layer.presentation()?.opacity ?? 1)
+        animation.toValue = appearing ? 1 : 0
+        animation.duration = appearing ? Self.fadeDuration : Self.fadeDuration * 0.75
+        animation.timingFunction = CAMediaTimingFunction(name: appearing ? .easeOut : .easeIn)
+        animation.isRemovedOnCompletion = appearing
+        animation.fillMode = .forwards
+        layer.add(animation, forKey: "visibility")
+        CATransaction.commit()
+    }
+    /// Fades the note out, then closes it. Used when a note is hidden, deleted or merged.
+    func dismiss() {
+        guard window?.isVisible == true else { close(); return }
+        endEditingWork?.cancel()
+        fade(in: false) { [self] in
+            close()
+            surface.layer?.removeAnimation(forKey: "visibility")
+        }
     }
     func bringForward() { groupRaised = true; transientFront = false; window?.level = .floating; window?.orderFrontRegardless() }
     func returnToDesktop() { groupRaised = false; transientFront = false; setLevel() }
     func windowDidResignKey(_ notification: Notification) {
         transientFront = false; if !groupRaised && appearancePopover?.isShown != true && window?.attachedSheet == nil { setLevel() }
-        setEditingServices(false); updateControlsVisibility()
+        setEditingServices(false); updateControlsVisibility(); scheduleEndEditing()
         if AppDelegate.shared.library?.window?.isVisible == true { AppDelegate.shared.library?.refresh() }
     }
-    func windowDidBecomeKey(_ notification: Notification) { setEditingServices(true); updateControlsVisibility() }
-    func windowDidMove(_ notification: Notification) { saveFrame() }
+    func windowDidBecomeKey(_ notification: Notification) { endEditingWork?.cancel(); setEditingServices(true); updateControlsVisibility() }
+    func windowDidMove(_ notification: Notification) { if !moving { saveFrame() } }
     func windowDidResize(_ notification: Notification) { layoutNote(); saveFrame() }
     func saveFrame() {
         guard !configuring, let frame = window?.frame, let note else { return }
@@ -558,6 +782,7 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         store.updateMany(ids, notify: false) { $0.x = frame.minX; $0.y = frame.minY; $0.width = frame.width; $0.height = frame.height }
     }
     func textDidChange(_ notification: Notification) {
+        guard let textView else { return }
         store.update(activeID, notify: false) { $0.text = textView.string }
         window?.title = note?.title ?? "Untitled note"
     }
@@ -579,7 +804,7 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
             if self.importsInProgress == 0 {
                 self.importSpinner?.stopAnimation(nil); self.importSpinner?.isHidden = true
                 if let button = self.attachButton {
-                    button.image = NSImage(systemSymbolName: "paperclip", accessibilityDescription: "Attachments"); button.isEnabled = true
+                    button.image = sharedSymbol("paperclip"); button.isEnabled = true
                 }
                 self.styleControls()
                 self.hovering = self.surface.bounds.contains(self.surface.convert(self.window?.mouseLocationOutsideOfEventStream ?? .zero, from: nil))
@@ -613,7 +838,9 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
             let preview = ActionButton("Open " + picture.name) { [weak self] in guard let self else { return }; NSWorkspace.shared.open(self.store.attachmentURL(picture)) }
             preview.title = ""; preview.imageScaling = .scaleProportionallyUpOrDown
             attachments.addArrangedSubview(preview, length: imageHeight)
-            ThumbnailLoader.shared.load(store.attachmentURL(picture), pixels: 440) { [weak self, weak preview] image in
+            let scale = window?.backingScaleFactor ?? 2
+            let box = CGSize(width: max(1, surface.bounds.width - 24) * scale, height: imageHeight * scale)
+            ThumbnailLoader.shared.load(store.attachmentURL(picture), fitting: box) { [weak self, weak preview] image in
                 if let image { preview?.image = image }
                 else {
                     self?.failedPreviewIDs.insert(picture.id)
@@ -744,7 +971,12 @@ final class ThumbnailLoader {
     private var pending: [NSString: [(NSImage?) -> Void]] = [:]
     init() { cache.countLimit = 24; cache.totalCostLimit = 4 * 1024 * 1024; failures.countLimit = 24 }
     func load(_ url: URL, pixels: Int, completion: @escaping (NSImage?) -> Void) {
-        let key = (url.path + "-" + String(pixels)) as NSString
+        load(url, fitting: CGSize(width: pixels, height: pixels), completion: completion)
+    }
+    /// Decodes only as many pixels as an aspect-fit preview in `box` (device pixels) shows.
+    func load(_ url: URL, fitting box: CGSize, completion: @escaping (NSImage?) -> Void) {
+        let box = CGSize(width: max(1, box.width.rounded(.up)), height: max(1, box.height.rounded(.up)))
+        let key = (url.path + "-\(Int(box.width))x\(Int(box.height))") as NSString
         lock.lock()
         if let image = cache.object(forKey: key) {
             lock.unlock(); DispatchQueue.main.async { completion(image) }; return
@@ -756,12 +988,22 @@ final class ThumbnailLoader {
             guard let self else { return }
             var result: NSImage?
             if let source = CGImageSourceCreateWithURL(url as CFURL, nil),
-               let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: pixels, kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) {
+               let cg = CGImageSourceCreateThumbnailAtIndex(source, 0, [kCGImageSourceCreateThumbnailFromImageAlways: true, kCGImageSourceThumbnailMaxPixelSize: Self.maxPixel(source, fitting: box), kCGImageSourceCreateThumbnailWithTransform: true] as CFDictionary) {
                 result = NSImage(cgImage: cg, size: NSSize(width: cg.width, height: cg.height))
                 self.cache.setObject(result!, forKey: key, cost: cg.bytesPerRow * cg.height)
             } else { self.failures.setObject(true, forKey: key) }
             self.lock.lock(); let callbacks = self.pending.removeValue(forKey: key) ?? []; self.lock.unlock()
             DispatchQueue.main.async { for callback in callbacks { callback(result) } }
         }
+    }
+    /// Longest side, in pixels, of the image once aspect-fit into `box` (never upscaled).
+    static func maxPixel(_ source: CGImageSource, fitting box: CGSize) -> Int {
+        let fallback = Int(max(box.width, box.height))
+        guard let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
+              var width = (properties[kCGImagePropertyPixelWidth] as? NSNumber)?.doubleValue,
+              var height = (properties[kCGImagePropertyPixelHeight] as? NSNumber)?.doubleValue, width > 0, height > 0 else { return fallback }
+        if let orientation = (properties[kCGImagePropertyOrientation] as? NSNumber)?.intValue, orientation >= 5 { swap(&width, &height) }
+        let scale = min(1, min(Double(box.width) / width, Double(box.height) / height))
+        return max(1, Int((max(width, height) * scale).rounded(.up)))
     }
 }
