@@ -106,6 +106,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
             store.preferences.desktopLayoutVersion = 2; store.save()
         }
+        // Blank notes hidden by an earlier version are cleared before anything is shown.
+        if store.discardBlankHidden() { store.save() }
         store.onChange = { [weak self] in self?.synchronize() }
         synchronize()
         if store.loadFailed || CommandLine.arguments.contains("--smoke-test") || CommandLine.arguments.contains("--show-library") { showLibrary() }
@@ -270,8 +272,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         }
         synchronize(); widgets[id.uuidString]?.show(focus: true)
     }
+    /// Hidden and blank notes delete immediately; only a visible note with content asks first.
     func confirmDelete(_ id: UUID) {
         guard let note = store.note(id) else { return }
+        if note.hidden || note.isBlank { store.delete(id); return }
         let alert = NSAlert(); alert.messageText = "Delete “\(String(note.title.prefix(45)))”?"
         alert.informativeText = "This permanently removes the note and its local attachments. You can hide a note to keep it for later."
         alert.addButton(withTitle: "Keep note"); alert.addButton(withTitle: "Delete")
@@ -353,7 +357,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stackWidget.window?.setContentSize(NSSize(width: 140, height: 96))
         stackWidget.surface.layoutSubtreeIfNeeded()
         capture(stackWidget.surface, "minimum-stack")
-        let minimumLayout = stackWidget.scroll.frame.height >= 28 && stackWidget.attachments.frame.height <= 60 && stackWidget.tabs.frame.height == 22
+        let minimumLayout = stackWidget.scroll.frame.height >= 28 && stackWidget.attachments.frame.height <= 60 && !stackWidget.dots.isHidden && stackWidget.dots.frame.height == 14 && stackWidget.dots.frame.maxX <= stackWidget.grip.frame.minX + 6
         stackWidget.window?.setContentSize(NSSize(width: 220, height: 280)); stackWidget.layoutNote()
         capture(stackWidget.surface, "attachments")
         let appearance = NoteAppearanceController(noteID: first.id)
@@ -368,9 +372,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let activeTabPreserved = preservedOnHide && widgets[stackID.uuidString] === stackWidget && stackWidget.activeID == second.id && stackWidget.textView.selectedRange() == NSRange(location: 3, length: 2)
         stackWidget.activeID = first.id; stackWidget.refresh()
 
-        let tabsAccessible = stackWidget.tabs.arrangedSubviews.filter { $0 is NSButton && ($0 as? NSButton)?.toolTip != "More notes" }.allSatisfy {
-            $0.accessibilityRole() == .radioButton && !($0.accessibilityLabel() ?? "").isEmpty
-        }
+        let dotsValue = stackWidget.dots.accessibilityValue() as? String ?? ""
+        let tabsAccessible = stackWidget.dots.accessibilityRole() == .tabGroup && dotsValue.hasPrefix("Note 1 of 2") && stackWidget.dots.range == 0..<2
+        // Clicking the second dot shows the second note; a swipe brings the first back.
+        let secondDot = NSPoint(x: stackWidget.dots.bounds.midX + PageDots.pitch / 2, y: stackWidget.dots.bounds.midY)
+        if let index = stackWidget.dots.index(at: secondDot) { stackWidget.dots.onSelect?(index) }
+        let dotSelects = stackWidget.activeID == second.id && stackWidget.dots.current == 1
+        stackWidget.scroll.onSwipe?(-1)
+        let swipeSwitches = dotSelects && stackWidget.activeID == first.id && stackWidget.dots.current == 0
+        let flush = widgets.values.allSatisfy { $0.window?.hasShadow == false && $0.surface.layer?.borderWidth == 0 }
         if let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .control, timestamp: 0, windowNumber: stackWidget.window!.windowNumber, context: nil, characters: "\t", charactersIgnoringModifiers: "\t", isARepeat: false, keyCode: 48) {
             stackWidget.textView.keyDown(with: event)
         }
@@ -422,9 +432,42 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 return
             }
             store.delete(first.id); store.delete(second.id)
+            // Hiding a blank note deletes it; hidden notes delete without a confirmation.
+            let blank = store.add()
+            store.update(blank.id) { $0.hidden = true }
+            let blankDiscarded = store.note(blank.id) == nil && widgets[blank.id.uuidString] == nil
+            let kept = store.add(text: "Keep me hidden")
+            store.update(kept.id) { $0.hidden = true }
+            showLibrary(); library?.filter.selectedSegment = 1; library?.refresh()
+            let hiddenCard = library?.cards.first { $0.note?.id == kept.id }
+            let trashVisible = hiddenCard?.deleteButton?.isHidden == false
+            capture(library?.window?.contentView, "library-hidden")
+            hiddenCard?.deleteButton?.actionHandler?()
+            let hiddenDeleted = trashVisible && store.note(kept.id) == nil
+            library?.close()
+            // Dropping one note's drag handle onto another stacks them.
+            let lower = store.add(text: "Drop target"), upper = store.add(text: "Dragged note")
+            let target = widgets[lower.id.uuidString]!, dragged = widgets[upper.id.uuidString]!
+            let screen = (NSScreen.main ?? NSScreen.screens[0]).visibleFrame
+            target.window?.setFrame(NSRect(x: screen.minX + 80, y: screen.minY + 80, width: 220, height: 180), display: true)
+            dragged.window?.setFrame(NSRect(x: screen.minX + 420, y: screen.minY + 80, width: 220, height: 180), display: true)
+            // Float both so no other app's window covers the drop point, then move the dragged
+            // note so its handle is under the cursor above the target, as in a real drag.
+            target.window?.level = .floating; dragged.window?.level = .floating
+            target.window?.orderFrontRegardless(); dragged.window?.orderFrontRegardless()
+            let dropPoint = NSPoint(x: target.window!.frame.midX, y: target.window!.frame.midY)
+            dragged.window?.setFrameOrigin(NSPoint(x: dropPoint.x - 40, y: dropPoint.y - 166))
+            // Let WindowServer apply the new frames and ordering, as between real drag events.
+            CATransaction.flush(); RunLoop.current.run(until: Date().addingTimeInterval(0.3))
+            dragged.trackStackTarget(at: dropPoint)
+            let highlighted = target.surface.stackTarget
+            dragged.finishMove(at: dropPoint)
+            let dropStacked = highlighted && !target.surface.stackTarget && store.note(lower.id)?.stackID != nil && store.note(lower.id)?.stackID == store.note(upper.id)?.stackID
+            store.delete(lower.id); store.delete(upper.id)
             do { try store.flush() } catch { preconditionFailure("Smoke save failed: \(error)") }
-            print("SMOKE TEST: stacked=\(stacked) hidden=\(hidden) restored=\(restored) unstacked=\(unstacked) minimumLayout=\(minimumLayout) resizeGesture=\(resizeGesture) sharedPin=\(sharedPin) allRaised=\(allRaised) tabsAccessible=\(tabsAccessible) keyboardCycle=\(keyboardCycle) focusedControls=\(cardFocused && focusedControls) staysAfterClosingUI=\(staysAfterClosingUI) activeTabPreserved=\(activeTabPreserved) quitWaitVisible=\(quitWaitVisible) quitWaitCancelled=\(quitWaitCancelled) thumbnailCoalesced=\(coalesced) failedPreviewCollapsed=\(failedPreviewCollapsed) cleanup=\(store.notes.count == savedCount)")
-            precondition(stacked && hidden && restored && unstacked && minimumLayout && resizeGesture && sharedPin && allRaised && tabsAccessible && keyboardCycle && cardFocused && focusedControls && staysAfterClosingUI && activeTabPreserved && quitWaitVisible && quitWaitCancelled && coalesced && failedPreviewCollapsed && store.notes.count == savedCount, "Desktop note regression failed")
+            print("SMOKE TEST: stacked=\(stacked) hidden=\(hidden) restored=\(restored) unstacked=\(unstacked) minimumLayout=\(minimumLayout) resizeGesture=\(resizeGesture) sharedPin=\(sharedPin) allRaised=\(allRaised) tabsAccessible=\(tabsAccessible) keyboardCycle=\(keyboardCycle) focusedControls=\(cardFocused && focusedControls) staysAfterClosingUI=\(staysAfterClosingUI) activeTabPreserved=\(activeTabPreserved) quitWaitVisible=\(quitWaitVisible) quitWaitCancelled=\(quitWaitCancelled) thumbnailCoalesced=\(coalesced) failedPreviewCollapsed=\(failedPreviewCollapsed) dotSelects=\(dotSelects) swipeSwitches=\(swipeSwitches) flush=\(flush) blankDiscarded=\(blankDiscarded) hiddenDeleted=\(hiddenDeleted) dropStacked=\(dropStacked) cleanup=\(store.notes.count == savedCount)")
+            fflush(stdout)
+            precondition(stacked && hidden && restored && unstacked && minimumLayout && resizeGesture && sharedPin && allRaised && tabsAccessible && keyboardCycle && cardFocused && focusedControls && staysAfterClosingUI && activeTabPreserved && quitWaitVisible && quitWaitCancelled && coalesced && failedPreviewCollapsed && dotSelects && swipeSwitches && flush && blankDiscarded && hiddenDeleted && dropStacked && store.notes.count == savedCount, "Desktop note regression failed")
             NSApp.terminate(nil)
         }
         var loaded: [NSImage?] = []
