@@ -5,6 +5,11 @@ import ServiceManagement
 final class LibraryWindow: NSWindow {
     // Esc closes the list (the search field consumes Esc first while it has text).
     override func cancelOperation(_ sender: Any?) { performClose(sender) }
+    override func performKeyEquivalent(with event: NSEvent) -> Bool { super.performKeyEquivalent(with: event) || KeyCommands.perform(event) }
+}
+
+final class PreferencesWindow: NSWindow {
+    override func performKeyEquivalent(with event: NSEvent) -> Bool { super.performKeyEquivalent(with: event) || KeyCommands.perform(event) }
 }
 
 final class LibraryController: NSWindowController, NSSearchFieldDelegate, NSWindowDelegate {
@@ -143,33 +148,40 @@ final class NoteCard: NSView {
         setAccessibilityElement(true); setAccessibilityRole(.button); setAccessibilityLabel(note?.title ?? "New note")
         guard let note else { return }
         setAccessibilityHelp(note.hidden ? "Hidden note. Press to show it on the desktop." : "Press to bring this note forward for editing.")
-        let more = IconButton("More actions", symbol: "ellipsis.circle", size: 14) { [weak self] in self?.showMenu() }
-        let copy = IconButton("Copy note", symbol: "doc.on.doc", size: 13) { [weak self] in
-            NSPasteboard.general.clearContents(); NSPasteboard.general.setString(note.text, forType: .string)
-            self?.buttons.first { $0.toolTip == "Copy note" }?.image = symbol("checkmark", size: 13, weight: .semibold)
-        }
-        let hide = IconButton(note.hidden ? "Show note" : "Hide note", symbol: note.hidden ? "eye" : "eye.slash", size: 13) {
-            NoteStore.shared.update(note.id) { $0.hidden.toggle() }
-        }
         setAccessibilityCustomActions([
-            NSAccessibilityCustomAction(name: "Copy") { copy.actionHandler?(); return true },
-            NSAccessibilityCustomAction(name: note.hidden ? "Show" : "Hide") { hide.actionHandler?(); return true },
+            NSAccessibilityCustomAction(name: "Copy") { [weak self] in self?.copyText(); return true },
+            NSAccessibilityCustomAction(name: note.hidden ? "Show" : "Hide") { NoteStore.shared.update(note.id) { $0.hidden.toggle() }; return true },
             NSAccessibilityCustomAction(name: "Delete") { AppDelegate.shared.confirmDelete(note.id); return true }
         ])
-        var all = [more, copy, hide]
         if note.hidden {
             let trash = IconButton("Delete now", symbol: "trash", size: 13) { NoteStore.shared.delete(note.id) }
             trash.contentTintColor = .systemRed
             trash.setAccessibilityHelp("Permanently deletes this hidden note without asking.")
-            deleteButton = trash; all.insert(trash, at: 0)
+            deleteButton = trash; install(trash)
         }
-        for button in all {
-            button.isHidden = button !== deleteButton; addSubview(button); buttons.append(button)
-            button.focusChanged = { [weak self] focused in
-                if focused { self?.showControls(true) }
-                else { DispatchQueue.main.async { [weak self] in self?.updateControls() } }
-            }
+    }
+    private func copyText() {
+        guard let note else { return }
+        NSPasteboard.general.clearContents(); NSPasteboard.general.setString(note.text, forType: .string)
+        buttons.first { $0.toolTip == "Copy note" }?.image = symbol("checkmark", size: 13, weight: .semibold)
+    }
+    private func install(_ button: IconButton) {
+        addSubview(button); buttons.append(button)
+        button.focusChanged = { [weak self] focused in
+            if focused { self?.showControls(true) }
+            else { DispatchQueue.main.async { [weak self] in self?.updateControls() } }
         }
+        needsLayout = true
+    }
+    /// Hover buttons are built the first time a card is hovered or focused, not for every
+    /// card each time the list opens.
+    private func ensureButtons() {
+        guard let note, buttons.count < (deleteButton == nil ? 3 : 4) else { return }
+        install(IconButton("More actions", symbol: "ellipsis.circle", size: 14) { [weak self] in self?.showMenu() })
+        install(IconButton("Copy note", symbol: "doc.on.doc", size: 13) { [weak self] in self?.copyText() })
+        install(IconButton(note.hidden ? "Show note" : "Hide note", symbol: note.hidden ? "eye" : "eye.slash", size: 13) {
+            NoteStore.shared.update(note.id) { $0.hidden.toggle() }
+        })
     }
     required init?(coder: NSCoder) { fatalError() }
     override var acceptsFirstResponder: Bool { true }
@@ -177,7 +189,10 @@ final class NoteCard: NSView {
     override func drawFocusRingMask() { NSBezierPath(roundedRect: bounds, xRadius: 10, yRadius: 10).fill() }
     override func becomeFirstResponder() -> Bool { showControls(true); return true }
     override func resignFirstResponder() -> Bool { DispatchQueue.main.async { [weak self] in self?.updateControls() }; return true }
-    func showControls(_ show: Bool) { buttons.forEach { $0.isHidden = !show && $0 !== deleteButton }; needsDisplay = true }
+    func showControls(_ show: Bool) {
+        if show { ensureButtons() }
+        buttons.forEach { $0.isHidden = !show && $0 !== deleteButton }; needsDisplay = true
+    }
     func updateControls() {
         let focus = window?.firstResponder as? NSView
         showControls(hovering || focus === self || focus?.isDescendant(of: self) == true)
@@ -331,7 +346,7 @@ final class PreferencesController: NSWindowController, NSWindowDelegate {
     var monitor: Any?
     var swatches: [SwatchButton] = []
     init() {
-        let window = NSWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 380), styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
+        let window = PreferencesWindow(contentRect: NSRect(x: 0, y: 0, width: 460, height: 380), styleMask: [.titled, .closable, .fullSizeContentView], backing: .buffered, defer: false)
         super.init(window: window)
         window.delegate = self; window.isReleasedWhenClosed = false; window.titlebarAppearsTransparent = true
         window.title = "GoodSticky Settings"; window.center()

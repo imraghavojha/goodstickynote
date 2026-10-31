@@ -72,10 +72,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     func applicationDidFinishLaunching(_ notification: Notification) {
         AppDelegate.shared = self
         NSApp.setActivationPolicy(.accessory)
-        buildMainMenu()
         DistributedNotificationCenter.default().addObserver(self, selector: #selector(showNotesRequested), name: Notification.Name("app.goodsticky.showNotes"), object: store.directory.path)
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.button?.image = NSImage(systemSymbolName: "note.text", accessibilityDescription: "GoodSticky")
+        statusItem.button?.image = Self.statusIcon
         statusItem.button?.toolTip = "GoodSticky — click for notes, right-click for more"
         statusItem.button?.target = self
         statusItem.button?.action = #selector(statusClicked(_:))
@@ -119,6 +118,22 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in self?.runSmokeTest() }
         }
     }
+    /// A drawn template icon (a note with lines). An SF Symbol here loads and keeps
+    /// the CoreSVG parse tree resident for the life of the app.
+    static let statusIcon: NSImage = {
+        let image = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+            NSColor.black.set()
+            let page = NSBezierPath(roundedRect: NSRect(x: 2.75, y: 2.75, width: 12.5, height: 12.5), xRadius: 2.6, yRadius: 2.6)
+            page.lineWidth = 1.5; page.stroke()
+            for (y, width) in [(11.0, 7.0), (8.25, 7.0), (5.5, 4.5)] {
+                let line = NSBezierPath(); line.lineWidth = 1.4; line.lineCapStyle = .round
+                line.move(to: NSPoint(x: 5.5, y: y)); line.line(to: NSPoint(x: 5.5 + width, y: y)); line.stroke()
+            }
+            return true
+        }
+        image.isTemplate = true; image.accessibilityDescription = "GoodSticky"
+        return image
+    }()
     @objc func showNotesRequested() { showLibrary() }
     /// Built on demand so it always reflects the current shortcut and note counts.
     func makeStatusMenu() -> NSMenu {
@@ -157,27 +172,6 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         } else if library?.window?.isVisible == true { library?.close() }
         else { showLibrary() }
     }
-    func buildMainMenu() {
-        let main = NSMenu()
-        let appItem = NSMenuItem(); let appMenu = NSMenu()
-        appMenu.addItem(ClosureMenuItem("About GoodSticky") {
-            NSApp.orderFrontStandardAboutPanel(options: [.applicationName: "GoodSticky", .applicationVersion: Bundle.main.object(forInfoDictionaryKey: "CFBundleShortVersionString") as? String ?? "0.2.0"])
-        })
-        let settings = ClosureMenuItem("Settings…") { self.showPreferences() }; settings.keyEquivalent = ","; appMenu.addItem(settings)
-        appMenu.addItem(.separator())
-        let quit = ClosureMenuItem("Quit GoodSticky") { NSApp.terminate(nil) }; quit.keyEquivalent = "q"; appMenu.addItem(quit)
-        appItem.submenu = appMenu; main.addItem(appItem)
-        let fileItem = NSMenuItem(); let fileMenu = NSMenu(title: "File")
-        let new = ClosureMenuItem("New note") { self.createNote() }; new.keyEquivalent = "n"; fileMenu.addItem(new)
-        let close = ClosureMenuItem("Close") { self.closeFrontmost() }; close.keyEquivalent = "w"; fileMenu.addItem(close)
-        fileItem.submenu = fileMenu; main.addItem(fileItem)
-        let editItem = NSMenuItem(); let editMenu = NSMenu(title: "Edit")
-        for (title, action, key) in [("Undo", Selector(("undo:")), "z"), ("Cut", #selector(NSText.cut(_:)), "x"), ("Copy", #selector(NSText.copy(_:)), "c"), ("Paste", #selector(NSText.paste(_:)), "v"), ("Select All", #selector(NSText.selectAll(_:)), "a")] {
-            editMenu.addItem(NSMenuItem(title: title, action: action, keyEquivalent: key))
-        }
-        editItem.submenu = editMenu; main.addItem(editItem)
-        NSApp.mainMenu = main
-    }
     func seedWelcomeNotes() {
         let first = store.add(text: "Draft notes\n\nReview the outline\nSend the first draft", theme: "butter")
         let second = store.add(text: "Weekend\n\nCoffee beans\nBook the train", theme: "sage")
@@ -213,7 +207,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             }
         }
         widgets = next
-        for obsolete in available.values { obsolete.close() }
+        for obsolete in available.values { obsolete.dismiss() }
         if library?.window?.isVisible == true { library?.refresh() }
     }
     func closeFrontmost() {
@@ -357,7 +351,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         stackWidget.window?.setContentSize(NSSize(width: 140, height: 96))
         stackWidget.surface.layoutSubtreeIfNeeded()
         capture(stackWidget.surface, "minimum-stack")
-        let minimumLayout = stackWidget.scroll.frame.height >= 28 && stackWidget.attachments.frame.height <= 60 && !stackWidget.dots.isHidden && stackWidget.dots.frame.height == 14 && stackWidget.dots.frame.maxX <= stackWidget.grip.frame.minX + 6
+        let minimumLayout = stackWidget.display.frame.height >= 28 && stackWidget.attachments.frame.height <= 60 && !stackWidget.dots.isHidden && stackWidget.dots.frame.height == 14 && stackWidget.dots.frame.maxX <= stackWidget.grip.frame.minX + 6
         stackWidget.window?.setContentSize(NSSize(width: 220, height: 280)); stackWidget.layoutNote()
         capture(stackWidget.surface, "attachments")
         let appearance = NoteAppearanceController(noteID: first.id)
@@ -365,11 +359,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         setPinned(first.id, pinned: true)
         let sharedPin = store.note(second.id)?.pinned == true
         stackWidget.activeID = second.id; stackWidget.refresh()
-        stackWidget.textView.setSelectedRange(NSRange(location: 3, length: 2))
+        stackWidget.beginEditing().setSelectedRange(NSRange(location: 3, length: 2))
         store.update(first.id) { $0.hidden = true }
-        let preservedOnHide = widgets[stackID.uuidString] === stackWidget && stackWidget.activeID == second.id && stackWidget.textView.selectedRange() == NSRange(location: 3, length: 2)
+        let preservedOnHide = widgets[stackID.uuidString] === stackWidget && stackWidget.activeID == second.id && stackWidget.textView?.selectedRange() == NSRange(location: 3, length: 2)
         store.update(first.id) { $0.hidden = false }
-        let activeTabPreserved = preservedOnHide && widgets[stackID.uuidString] === stackWidget && stackWidget.activeID == second.id && stackWidget.textView.selectedRange() == NSRange(location: 3, length: 2)
+        let activeTabPreserved = preservedOnHide && widgets[stackID.uuidString] === stackWidget && stackWidget.activeID == second.id && stackWidget.textView?.selectedRange() == NSRange(location: 3, length: 2)
         stackWidget.activeID = first.id; stackWidget.refresh()
 
         let dotsValue = stackWidget.dots.accessibilityValue() as? String ?? ""
@@ -378,11 +372,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         let secondDot = NSPoint(x: stackWidget.dots.bounds.midX + PageDots.pitch / 2, y: stackWidget.dots.bounds.midY)
         if let index = stackWidget.dots.index(at: secondDot) { stackWidget.dots.onSelect?(index) }
         let dotSelects = stackWidget.activeID == second.id && stackWidget.dots.current == 1
-        stackWidget.scroll.onSwipe?(-1)
+        stackWidget.scroll?.onSwipe?(-1)
         let swipeSwitches = dotSelects && stackWidget.activeID == first.id && stackWidget.dots.current == 0
         let flush = widgets.values.allSatisfy { $0.window?.hasShadow == false && $0.surface.layer?.borderWidth == 0 }
         if let event = NSEvent.keyEvent(with: .keyDown, location: .zero, modifierFlags: .control, timestamp: 0, windowNumber: stackWidget.window!.windowNumber, context: nil, characters: "\t", charactersIgnoringModifiers: "\t", isARepeat: false, keyCode: 48) {
-            stackWidget.textView.keyDown(with: event)
+            stackWidget.textView?.keyDown(with: event)
         }
         let keyboardCycle = stackWidget.activeID == second.id
         stackWidget.activeID = first.id; stackWidget.refresh()
@@ -464,10 +458,19 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             dragged.finishMove(at: dropPoint)
             let dropStacked = highlighted && !target.surface.stackTarget && store.note(lower.id)?.stackID != nil && store.note(lower.id)?.stackID == store.note(upper.id)?.stackID
             store.delete(lower.id); store.delete(upper.id)
+            // Editors are created on demand and released back to the cheap display.
+            let solo = store.add(text: "Solo")
+            let soloWidget = widgets[solo.id.uuidString]!
+            let idleWithoutEditor = soloWidget.textView == nil && !soloWidget.display.isHidden
+            let editor = soloWidget.beginEditing()
+            editor.setSelectedRange(NSRange(location: editor.string.count, length: 0)); editor.insertText(" edited", replacementRange: editor.selectedRange())
+            soloWidget.window?.resignKey(); soloWidget.endEditing()
+            let editorRoundTrip = idleWithoutEditor && soloWidget.textView == nil && !soloWidget.display.isHidden && soloWidget.display.text == "Solo edited" && store.note(solo.id)?.text == "Solo edited"
+            store.delete(solo.id)
             do { try store.flush() } catch { preconditionFailure("Smoke save failed: \(error)") }
-            print("SMOKE TEST: stacked=\(stacked) hidden=\(hidden) restored=\(restored) unstacked=\(unstacked) minimumLayout=\(minimumLayout) resizeGesture=\(resizeGesture) sharedPin=\(sharedPin) allRaised=\(allRaised) tabsAccessible=\(tabsAccessible) keyboardCycle=\(keyboardCycle) focusedControls=\(cardFocused && focusedControls) staysAfterClosingUI=\(staysAfterClosingUI) activeTabPreserved=\(activeTabPreserved) quitWaitVisible=\(quitWaitVisible) quitWaitCancelled=\(quitWaitCancelled) thumbnailCoalesced=\(coalesced) failedPreviewCollapsed=\(failedPreviewCollapsed) dotSelects=\(dotSelects) swipeSwitches=\(swipeSwitches) flush=\(flush) blankDiscarded=\(blankDiscarded) hiddenDeleted=\(hiddenDeleted) dropStacked=\(dropStacked) cleanup=\(store.notes.count == savedCount)")
+            print("SMOKE TEST: stacked=\(stacked) hidden=\(hidden) restored=\(restored) unstacked=\(unstacked) minimumLayout=\(minimumLayout) resizeGesture=\(resizeGesture) sharedPin=\(sharedPin) allRaised=\(allRaised) tabsAccessible=\(tabsAccessible) keyboardCycle=\(keyboardCycle) focusedControls=\(cardFocused && focusedControls) staysAfterClosingUI=\(staysAfterClosingUI) activeTabPreserved=\(activeTabPreserved) quitWaitVisible=\(quitWaitVisible) quitWaitCancelled=\(quitWaitCancelled) thumbnailCoalesced=\(coalesced) failedPreviewCollapsed=\(failedPreviewCollapsed) dotSelects=\(dotSelects) swipeSwitches=\(swipeSwitches) flush=\(flush) blankDiscarded=\(blankDiscarded) hiddenDeleted=\(hiddenDeleted) dropStacked=\(dropStacked) editorRoundTrip=\(editorRoundTrip) cleanup=\(store.notes.count == savedCount)")
             fflush(stdout)
-            precondition(stacked && hidden && restored && unstacked && minimumLayout && resizeGesture && sharedPin && allRaised && tabsAccessible && keyboardCycle && cardFocused && focusedControls && staysAfterClosingUI && activeTabPreserved && quitWaitVisible && quitWaitCancelled && coalesced && failedPreviewCollapsed && dotSelects && swipeSwitches && flush && blankDiscarded && hiddenDeleted && dropStacked && store.notes.count == savedCount, "Desktop note regression failed")
+            precondition(stacked && hidden && restored && unstacked && minimumLayout && resizeGesture && sharedPin && allRaised && tabsAccessible && keyboardCycle && cardFocused && focusedControls && staysAfterClosingUI && activeTabPreserved && quitWaitVisible && quitWaitCancelled && coalesced && failedPreviewCollapsed && dotSelects && swipeSwitches && flush && blankDiscarded && hiddenDeleted && dropStacked && editorRoundTrip && store.notes.count == savedCount, "Desktop note regression failed")
             NSApp.terminate(nil)
         }
         var loaded: [NSImage?] = []
