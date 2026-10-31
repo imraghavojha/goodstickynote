@@ -8,7 +8,7 @@ if pgrep -f "^$DEST/Contents/MacOS/GoodSticky([[:space:]]|$)" >/dev/null; then
 fi
 ./scripts/build.sh
 mkdir -p .build/checks
-swiftc -parse-as-library Sources/GoodSticky/Model.swift Sources/GoodSticky/ResidentLock.swift scripts/install-app.swift -o .build/checks/InstallApp
+swiftc -parse-as-library Sources/GoodSticky/LibraryLocation.swift Sources/GoodSticky/ResidentLock.swift scripts/install-app.swift -o .build/checks/InstallApp
 .build/checks/InstallApp "$PWD/dist/GoodSticky.app" "$DEST"
 open "$DEST" --args --enable-login
 print "Installed $DEST"
