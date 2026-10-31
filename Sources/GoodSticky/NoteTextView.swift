@@ -1,7 +1,7 @@
 import AppKit
 
 final class NoteTextView: NSTextView {
-    var history: NoteHistory?
+    weak var history: NoteHistory?
     private var pendingEdits: [(NoteHistory.Edit, NSRange)] = []
     private var composing = false
     override var undoManager: UndoManager? { history?.manager }
