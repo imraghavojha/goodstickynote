@@ -7,6 +7,7 @@ final class StickyPanel: NSPanel {
     override var canBecomeMain: Bool { false }
 }
 
+/// The paper is drawn entirely with layer properties, so a note owns no full-size bitmap.
 final class WidgetSurface: NSView {
     var theme = NoteTheme.all[0] { didSet { needsDisplay = true } }
     var paperOpacity: CGFloat = 1 { didSet { needsDisplay = true } }
@@ -18,9 +19,19 @@ final class WidgetSurface: NSView {
     private var dropping = false
     override init(frame: NSRect) {
         super.init(frame: frame)
+        wantsLayer = true
+        layerContentsRedrawPolicy = .onSetNeedsDisplay
         registerForDraggedTypes([.fileURL])
     }
     required init?(coder: NSCoder) { fatalError() }
+    override var wantsUpdateLayer: Bool { true }
+    override func updateLayer() {
+        guard let layer else { return }
+        layer.cornerRadius = 8; layer.cornerCurve = .continuous
+        layer.backgroundColor = theme.paper.withAlphaComponent(paperOpacity).cgColor
+        layer.borderColor = theme.ink.withAlphaComponent(dropping ? 0.6 : 0.12).cgColor
+        layer.borderWidth = dropping ? 2 : 1
+    }
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
         if let tracking { removeTrackingArea(tracking) }
@@ -29,13 +40,6 @@ final class WidgetSurface: NSView {
     }
     override func mouseEntered(with event: NSEvent) { onHover?(true) }
     override func mouseExited(with event: NSEvent) { onHover?(false) }
-    override func draw(_ dirtyRect: NSRect) {
-        let path = NSBezierPath(roundedRect: bounds.insetBy(dx: 1, dy: 1), xRadius: 7, yRadius: 7)
-        theme.paper.withAlphaComponent(paperOpacity).setFill(); path.fill()
-        theme.ink.withAlphaComponent(dropping ? 0.65 : 0.12).setStroke()
-        path.lineWidth = dropping ? 3 : 1; path.stroke()
-
-    }
     override func draggingEntered(_ sender: NSDraggingInfo) -> NSDragOperation {
         dropping = true; needsDisplay = true; return .copy
     }
@@ -47,13 +51,41 @@ final class WidgetSurface: NSView {
     }
 }
 
-final class DragHandle: NSView {
-    var tint = NSColor.gray
-    override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
-    override func draw(_ dirtyRect: NSRect) {
-        tint.withAlphaComponent(0.35).setFill()
-        for index in 0..<3 { NSBezierPath(ovalIn: NSRect(x: 10 + CGFloat(index) * 3, y: 12, width: 1.5, height: 1.5)).fill() }
+/// Small vector marks rendered by the window server instead of per-view bitmaps.
+class ShapeMarkView: NSView {
+    let shape = CAShapeLayer()
+    var tint = NSColor.gray { didSet { applyTint() } }
+    var tintAlpha: CGFloat = 0.35 { didSet { applyTint() } }
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true
+        layer?.addSublayer(shape)
+        shape.lineCap = .round
+        applyTint()
     }
+    required init?(coder: NSCoder) { fatalError() }
+    func applyTint() {
+        shape.fillColor = filled ? tint.withAlphaComponent(tintAlpha).cgColor : nil
+        shape.strokeColor = filled ? nil : tint.withAlphaComponent(tintAlpha).cgColor
+    }
+    var filled: Bool { true }
+    func path(in bounds: CGRect) -> CGPath { CGMutablePath() }
+    override func layout() {
+        super.layout()
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        shape.frame = bounds; shape.path = path(in: bounds)
+        CATransaction.commit()
+    }
+    override func setFrameSize(_ newSize: NSSize) { super.setFrameSize(newSize); needsLayout = true }
+}
+
+final class DragHandle: ShapeMarkView {
+    override func path(in bounds: CGRect) -> CGPath {
+        let path = CGMutablePath()
+        for index in 0..<3 { path.addEllipse(in: CGRect(x: 10 + CGFloat(index) * 3.5, y: 12, width: 2, height: 2)) }
+        return path
+    }
+    override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
 }
@@ -86,15 +118,23 @@ final class NoteTextView: NSTextView {
     }
 }
 
-final class ResizeGrip: NSView {
-    var tint = NSColor.gray
+final class ResizeGrip: ShapeMarkView {
+    override var filled: Bool { false }
+    override func path(in bounds: CGRect) -> CGPath {
+        let path = CGMutablePath()
+        for offset in [4.0, 8.0] {
+            path.move(to: CGPoint(x: bounds.width - offset - 2, y: 3))
+            path.addLine(to: CGPoint(x: bounds.width - 3, y: offset + 2))
+        }
+        return path
+    }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
     override func accessibilityValue() -> Any? { guard let frame = window?.frame else { return nil }; return "\(Int(frame.width)) × \(Int(frame.height))" }
     override var acceptsFirstResponder: Bool { true }
     private var dragFrame: NSRect?
     private var dragStart = NSPoint.zero
     override init(frame: NSRect) {
-        super.init(frame: frame); toolTip = "Resize note"
+        super.init(frame: frame); toolTip = "Resize note"; tintAlpha = 0.55; shape.lineWidth = 1
         setAccessibilityElement(true); setAccessibilityRole(.button); setAccessibilityLabel("Resize note")
         setAccessibilityHelp("Drag the corner, or use arrow keys when focused.")
         setAccessibilityCustomActions([
@@ -106,14 +146,6 @@ final class ResizeGrip: NSView {
     override func resetCursorRects() {
         if #available(macOS 15, *) { addCursorRect(bounds, cursor: .frameResize(position: .bottomRight, directions: [.inward, .outward])) }
         else { addCursorRect(bounds, cursor: .crosshair) }
-    }
-    override func draw(_ dirtyRect: NSRect) {
-        tint.withAlphaComponent(0.55).setStroke()
-        for offset in [4.0, 8.0] {
-            let line = NSBezierPath(); line.lineWidth = 1; line.lineCapStyle = .round
-            line.move(to: NSPoint(x: bounds.width - offset - 2, y: 3))
-            line.line(to: NSPoint(x: bounds.width - 3, y: offset + 2)); line.stroke()
-        }
     }
     override func accessibilityPerformPress() -> Bool { window?.makeFirstResponder(self) ?? false }
     override func mouseDown(with event: NSEvent) {
@@ -159,15 +191,19 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
     let scroll = NSScrollView()
     let handle = DragHandle()
     let caption = label("", size: 10, weight: .medium)
-    let controls = NSStackView()
-    let attachments = NSStackView()
-    let tabs = NSStackView()
+    /// Hover controls are built on first hover/focus; most desktop notes never need them.
+    private(set) var controls: FrameStack?
+    private var copyButton: ActionButton?
+    private var attachButton: ActionButton?
+    private var importSpinner: NSProgressIndicator?
+    private var hovering = false
+    let attachments = FrameStack(.vertical, spacing: 4)
+    let tabs = FrameStack(.horizontal, spacing: 4)
     let grip = ResizeGrip(frame: .zero)
     private var appearancePopover: NSPopover?
     private var attachmentKey = ""
     private var failedPreviewIDs = Set<UUID>()
     private var importsInProgress = 0
-    private let importSpinner = NSProgressIndicator()
     private var tabCapacity = 0
     private var configuring = false
     private var layingOut = false
@@ -192,40 +228,15 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
             let saved = NSRect(x: note.x, y: note.y, width: max(140, note.width), height: max(96, note.height))
             let visible = (NSScreen.screens.first { $0.visibleFrame.intersects(saved) } ?? NSScreen.main)?.visibleFrame ?? saved
             let width = min(saved.width, visible.width), height = min(saved.height, visible.height)
-            panel.setFrame(NSRect(x: min(max(saved.minX, visible.minX), visible.maxX - width), y: min(max(saved.minY, visible.minY), visible.maxY - height), width: width, height: height), display: true)
+            panel.setFrame(NSRect(x: min(max(saved.minX, visible.minX), visible.maxX - width), y: min(max(saved.minY, visible.minY), visible.maxY - height), width: width, height: height), display: false)
         }
         configuring = false
-        refresh(); layoutNote()
+        refresh()
     }
     required init?(coder: NSCoder) { fatalError() }
     func setup() {
         surface.addSubview(handle); handle.toolTip = "Drag to move"
         surface.addSubview(caption)
-        let copy = ActionButton("Copy note", symbol: "doc.on.doc") { [weak self] in
-            guard let self, let note = self.note else { return }
-            NSPasteboard.general.clearContents(); NSPasteboard.general.setString(note.text, forType: .string)
-            (self.controls.arrangedSubviews.first as? NSButton)?.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: "Copied")
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
-                (self?.controls.arrangedSubviews.first as? NSButton)?.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Copy note")
-            }
-        }
-        let hide = ActionButton("Hide note", symbol: "minus") { [weak self] in
-            guard let self else { return }; self.store.update(self.activeID) { $0.hidden = true }
-        }
-        let attach = ActionButton("Attach files", symbol: "paperclip") { [weak self] in self?.showAttachments() }
-        importSpinner.frame = NSRect(x: 3, y: 4, width: 15, height: 15)
-        importSpinner.style = .spinning; importSpinner.controlSize = .small; importSpinner.isDisplayedWhenStopped = false; importSpinner.isHidden = true
-        importSpinner.setAccessibilityLabel("Importing files"); attach.addSubview(importSpinner)
-        let appearance = ActionButton("Color and opacity", symbol: "paintpalette") { [weak self] in self?.showAppearance() }
-        let menu = ActionButton("Note options", symbol: "ellipsis") { [weak self] in self?.showMenu() }
-        controls.orientation = .horizontal; controls.spacing = 0; controls.isHidden = true
-        for button in [copy, hide, attach, appearance, menu] {
-            controls.addArrangedSubview(button)
-            button.translatesAutoresizingMaskIntoConstraints = false
-            button.widthAnchor.constraint(equalToConstant: 21).isActive = true
-            button.heightAnchor.constraint(equalToConstant: 22).isActive = true
-        }
-        surface.addSubview(controls)
         scroll.drawsBackground = false; scroll.borderType = .noBorder
         scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
         textView.allowsUndo = true; textView.isRichText = false; textView.drawsBackground = false
@@ -234,21 +245,62 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         textView.isVerticallyResizable = true; textView.isHorizontallyResizable = false
         textView.autoresizingMask = [.width]; textView.textContainer?.widthTracksTextView = true
         textView.isAutomaticSpellingCorrectionEnabled = false; textView.delegate = self
+        // Text checking services load lazily, only while a note is being edited.
+        setEditingServices(false)
         textView.onFiles = { [weak self] in self?.addFiles($0) }
         textView.onCycle = { [weak self] direction in
             guard let self, let index = self.ids.firstIndex(of: self.activeID), self.ids.count > 1 else { return }
             self.activeID = self.ids[(index + direction + self.ids.count) % self.ids.count]; self.refresh()
         }
         scroll.documentView = textView; surface.addSubview(scroll)
-        attachments.orientation = .vertical; attachments.alignment = .leading; attachments.spacing = 4
-        tabs.orientation = .horizontal; tabs.spacing = 4
         surface.addSubview(attachments); surface.addSubview(tabs); surface.addSubview(grip)
         surface.onHover = { [weak self] hovering in
             guard let self else { return }
-            self.controls.isHidden = !hovering && self.window?.isKeyWindow != true && self.importsInProgress == 0
+            self.hovering = hovering; self.updateControlsVisibility()
         }
         surface.onDrop = { [weak self] in self?.addFiles($0) }
         surface.onLayout = { [weak self] in self?.layoutNote() }
+    }
+    @discardableResult func ensureControls() -> FrameStack {
+        if let controls { return controls }
+        let copy = ActionButton("Copy note", symbol: "doc.on.doc") { [weak self] in
+            guard let self, let note = self.note else { return }
+            NSPasteboard.general.clearContents(); NSPasteboard.general.setString(note.text, forType: .string)
+            self.copyButton?.image = NSImage(systemSymbolName: "checkmark", accessibilityDescription: "Copied")
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { [weak self] in
+                self?.copyButton?.image = NSImage(systemSymbolName: "doc.on.doc", accessibilityDescription: "Copy note")
+            }
+        }
+        let hide = ActionButton("Hide note", symbol: "minus") { [weak self] in
+            guard let self else { return }; self.store.update(self.activeID) { $0.hidden = true }
+        }
+        let attach = ActionButton("Attach files", symbol: "paperclip") { [weak self] in self?.showAttachments() }
+        let appearance = ActionButton("Appearance", symbol: "paintpalette") { [weak self] in self?.showAppearance() }
+        let menu = ActionButton("Note options", symbol: "ellipsis") { [weak self] in self?.showMenu() }
+        let stack = FrameStack(.horizontal); stack.isHidden = true
+        for button in [copy, hide, attach, appearance, menu] { stack.addArrangedSubview(button, length: 21) }
+        copyButton = copy; attachButton = attach; controls = stack
+        surface.addSubview(stack)
+        styleControls(); layoutNote()
+        return stack
+    }
+    func styleControls() {
+        guard let controls, let note else { return }
+        for case let button as NSButton in controls.arrangedSubviews { button.contentTintColor = note.theme.ink }
+        if let attachButton, importsInProgress == 0 {
+            attachButton.toolTip = note.attachments.isEmpty ? "Attach files" : "\(note.attachments.count) \(note.attachments.count == 1 ? "attachment" : "attachments")"
+            attachButton.setAccessibilityLabel(attachButton.toolTip)
+        }
+    }
+    func updateControlsVisibility() {
+        let visible = hovering || window?.isKeyWindow == true || importsInProgress > 0
+        if visible { ensureControls() }
+        controls?.isHidden = !visible
+    }
+    func setEditingServices(_ editing: Bool) {
+        // Idle desktop notes skip spelling markers, so the spell checker never loads until someone edits.
+        guard textView.isContinuousSpellCheckingEnabled != editing else { return }
+        textView.isContinuousSpellCheckingEnabled = editing
     }
     func refreshCaption() { caption.stringValue = ids.count > 1 ? "\(ids.count) notes" : "" }
     func refresh(using supplied: StickyNote? = nil) {
@@ -263,13 +315,9 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         textView.defaultParagraphStyle = paragraph
         textView.typingAttributes = [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: note.theme.ink, .paragraphStyle: paragraph]
         caption.textColor = note.theme.ink.withAlphaComponent(0.85)
-        handle.tint = note.theme.ink; handle.needsDisplay = true
-        grip.tint = note.theme.ink; grip.needsDisplay = true
-        for case let button as NSButton in controls.arrangedSubviews { button.contentTintColor = note.theme.ink }
-        if let attachmentButton = controls.arrangedSubviews.dropFirst(2).first as? NSButton {
-            attachmentButton.toolTip = note.attachments.isEmpty ? "Attach files" : "\(note.attachments.count) \(note.attachments.count == 1 ? "attachment" : "attachments")"
-            attachmentButton.setAccessibilityLabel(attachmentButton.toolTip)
-        }
+        handle.tint = note.theme.ink
+        grip.tint = note.theme.ink
+        styleControls()
         refreshCaption()
         if note.pinned { window?.level = .floating }
         else if !transientFront && !groupRaised && window?.isKeyWindow != true && appearancePopover?.isShown != true && window?.attachedSheet == nil { setLevel() }
@@ -283,7 +331,7 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         let width = surface.bounds.width, height = surface.bounds.height
         guard width > 0, height > 0 else { return }
         handle.frame = NSRect(x: 0, y: height - 27, width: max(24, width - 112), height: 27)
-        controls.frame = NSRect(x: width - 111, y: height - 25, width: 105, height: 22)
+        controls?.frame = NSRect(x: width - 111, y: height - 25, width: 105, height: 22)
         caption.isHidden = width < 245
         caption.frame = NSRect(x: 12, y: height - 22, width: max(0, width - 130), height: 15)
         grip.frame = NSRect(x: width - 17, y: 0, width: 17, height: 17)
@@ -310,7 +358,7 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         if attachmentHeight > 0 { bottom += attachmentHeight + 6 }
         scroll.frame = NSRect(x: 10, y: bottom, width: max(0, width - 20), height: max(20, height - 28 - bottom))
     }
-    override func close() { importSpinner.stopAnimation(nil); appearancePopover?.close(); super.close() }
+    override func close() { importSpinner?.stopAnimation(nil); appearancePopover?.close(); super.close() }
     func updateMembers(_ members: [UUID]) {
         let sameEditor = members.contains(activeID)
         ids = members
@@ -335,10 +383,11 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
     func bringForward() { groupRaised = true; transientFront = false; window?.level = .floating; window?.orderFrontRegardless() }
     func returnToDesktop() { groupRaised = false; transientFront = false; setLevel() }
     func windowDidResignKey(_ notification: Notification) {
-        transientFront = false; if !groupRaised && appearancePopover?.isShown != true && window?.attachedSheet == nil { setLevel() }; controls.isHidden = importsInProgress == 0
+        transientFront = false; if !groupRaised && appearancePopover?.isShown != true && window?.attachedSheet == nil { setLevel() }
+        setEditingServices(false); updateControlsVisibility()
         if AppDelegate.shared.library?.window?.isVisible == true { AppDelegate.shared.library?.refresh() }
     }
-    func windowDidBecomeKey(_ notification: Notification) { controls.isHidden = false }
+    func windowDidBecomeKey(_ notification: Notification) { setEditingServices(true); updateControlsVisibility() }
     func windowDidMove(_ notification: Notification) { saveFrame() }
     func windowDidResize(_ notification: Notification) { layoutNote(); saveFrame() }
     func saveFrame() {
@@ -352,18 +401,27 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
     }
     func addFiles(_ urls: [URL]) {
         guard !urls.isEmpty else { return }
-        importsInProgress += 1; controls.isHidden = false; importSpinner.isHidden = false; importSpinner.startAnimation(nil)
-        if let button = controls.arrangedSubviews.dropFirst(2).first as? NSButton { button.image = nil; button.isEnabled = false; button.toolTip = "Importing files" }
+        importsInProgress += 1; ensureControls(); updateControlsVisibility()
+        if let button = attachButton {
+            if importSpinner == nil {
+                let spinner = NSProgressIndicator(frame: NSRect(x: 3, y: 4, width: 15, height: 15))
+                spinner.style = .spinning; spinner.controlSize = .small; spinner.isDisplayedWhenStopped = false
+                spinner.setAccessibilityLabel("Importing files"); button.addSubview(spinner); importSpinner = spinner
+            }
+            button.image = nil; button.isEnabled = false; button.toolTip = "Importing files"
+        }
+        importSpinner?.isHidden = false; importSpinner?.startAnimation(nil)
         store.attach(urls, to: activeID) { [weak self] in
             guard let self else { return }
             self.importsInProgress -= 1
             if self.importsInProgress == 0 {
-                self.importSpinner.stopAnimation(nil); self.importSpinner.isHidden = true
-                if let button = self.controls.arrangedSubviews.dropFirst(2).first as? NSButton {
+                self.importSpinner?.stopAnimation(nil); self.importSpinner?.isHidden = true
+                if let button = self.attachButton {
                     button.image = NSImage(systemSymbolName: "paperclip", accessibilityDescription: "Attachments"); button.isEnabled = true
-                    button.toolTip = self.note?.attachments.isEmpty == false ? "Attachments" : "Attach files"
                 }
-                self.controls.isHidden = self.window?.isKeyWindow != true && !self.surface.bounds.contains(self.surface.convert(self.window?.mouseLocationOutsideOfEventStream ?? .zero, from: nil))
+                self.styleControls()
+                self.hovering = self.surface.bounds.contains(self.surface.convert(self.window?.mouseLocationOutsideOfEventStream ?? .zero, from: nil))
+                self.updateControlsVisibility()
             }
         }
     }
@@ -387,14 +445,12 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         picker.beginSheetModal(for: window) { [weak self] response in if response == .OK { self?.addFiles(picker.urls) } }
     }
     func rebuildAttachments(rows: Int, imageHeight: CGFloat) {
-        attachments.arrangedSubviews.forEach { attachments.removeArrangedSubview($0); $0.removeFromSuperview() }
+        attachments.removeAllArrangedSubviews()
         guard let note else { return }
         if imageHeight > 0, let picture = note.attachments.first(where: { !failedPreviewIDs.contains($0.id) && UTType(filenameExtension: URL(fileURLWithPath: $0.name).pathExtension)?.conforms(to: .image) == true }) {
             let preview = ActionButton("Open " + picture.name) { [weak self] in guard let self else { return }; NSWorkspace.shared.open(self.store.attachmentURL(picture)) }
             preview.title = ""; preview.imageScaling = .scaleProportionallyUpOrDown
-            attachments.addArrangedSubview(preview); preview.translatesAutoresizingMaskIntoConstraints = false
-            preview.widthAnchor.constraint(equalTo: attachments.widthAnchor).isActive = true
-            preview.heightAnchor.constraint(equalToConstant: imageHeight).isActive = true
+            attachments.addArrangedSubview(preview, length: imageHeight)
             ThumbnailLoader.shared.load(store.attachmentURL(picture), pixels: 440) { [weak self, weak preview] image in
                 if let image { preview?.image = image }
                 else {
@@ -405,21 +461,17 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
             }
         }
         for attachment in note.attachments.prefix(rows) {
-            let row = NSStackView(); row.spacing = 4
+            let row = FrameStack(.horizontal, spacing: 4)
             let file = ActionButton(attachment.name, symbol: "doc") { [weak self] in guard let self else { return }; NSWorkspace.shared.open(self.store.attachmentURL(attachment)) }
             file.imagePosition = .imageLeading; file.alignment = .left; file.lineBreakMode = .byTruncatingMiddle
             file.font = .systemFont(ofSize: 10); file.contentTintColor = note.theme.ink
             let remove = ActionButton("Remove attachment", symbol: "xmark") { [weak self] in guard let self else { return }; self.store.removeAttachment(attachment, from: self.activeID) }
             remove.contentTintColor = note.theme.ink
-            row.addArrangedSubview(file); row.addArrangedSubview(remove); attachments.addArrangedSubview(row)
-            row.translatesAutoresizingMaskIntoConstraints = false
-            row.widthAnchor.constraint(equalTo: attachments.widthAnchor).isActive = true
-            row.heightAnchor.constraint(equalToConstant: 22).isActive = true
-            remove.widthAnchor.constraint(equalToConstant: 18).isActive = true
+            row.addArrangedSubview(file); row.addArrangedSubview(remove, length: 18); attachments.addArrangedSubview(row, length: 22)
         }
     }
     func rebuildTabs() {
-        tabs.arrangedSubviews.forEach { tabs.removeArrangedSubview($0); $0.removeFromSuperview() }
+        tabs.removeAllArrangedSubviews()
         guard ids.count > 1 else { return }
         var displayed = Array(ids.prefix(tabCapacity))
         if !displayed.contains(activeID) { displayed[displayed.count - 1] = activeID }
@@ -431,8 +483,7 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
             button.setAccessibilityRole(.radioButton); button.setAccessibilityValue(id == activeID ? 1 : 0)
             button.wantsLayer = true; button.layer?.cornerRadius = 4
             button.layer?.backgroundColor = id == activeID ? note?.theme.ink.withAlphaComponent(0.14).cgColor : NSColor.clear.cgColor
-            tabs.addArrangedSubview(button); button.translatesAutoresizingMaskIntoConstraints = false
-            button.widthAnchor.constraint(equalToConstant: 52).isActive = true
+            tabs.addArrangedSubview(button, length: 52)
         }
         if ids.count > displayed.count {
             let more = ActionButton("More notes", symbol: "ellipsis") { [weak self] in
@@ -444,8 +495,7 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
                 }
                 menu.popUp(positioning: nil, at: NSPoint(x: 12, y: 28), in: self.surface)
             }
-            more.contentTintColor = note?.theme.ink; tabs.addArrangedSubview(more); more.translatesAutoresizingMaskIntoConstraints = false
-            more.widthAnchor.constraint(equalToConstant: 22).isActive = true
+            more.contentTintColor = note?.theme.ink; tabs.addArrangedSubview(more, length: 22)
         }
     }
     func showAppearance() {
@@ -500,6 +550,38 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         item("Delete note…") { [weak self] in guard let self else { return }; AppDelegate.shared.confirmDelete(self.activeID) }
         menu.popUp(positioning: nil, at: NSPoint(x: surface.bounds.width - 30, y: surface.bounds.height - 40), in: surface)
     }
+}
+
+/// A constraint-free stack. Note windows use only frame layout, so AppKit never spins up
+/// an Auto Layout engine per note. Each arranged view keeps its own fixed length; a length
+/// of 0 stretches it to fill the remaining space.
+final class FrameStack: NSView {
+    enum Axis { case horizontal, vertical }
+    var axis: Axis = .horizontal
+    var spacing: CGFloat = 0
+    private var lengths: [ObjectIdentifier: CGFloat] = [:]
+    var arrangedSubviews: [NSView] { subviews }
+    convenience init(_ axis: Axis, spacing: CGFloat = 0) { self.init(frame: .zero); self.axis = axis; self.spacing = spacing }
+    override var isFlipped: Bool { true }
+    func addArrangedSubview(_ view: NSView, length: CGFloat = 0) {
+        lengths[ObjectIdentifier(view)] = length; addSubview(view); needsLayout = true
+    }
+    func removeAllArrangedSubviews() { subviews.forEach { $0.removeFromSuperview() }; lengths.removeAll() }
+    override func layout() {
+        super.layout()
+        let total = axis == .horizontal ? bounds.width : bounds.height
+        let fixed = subviews.reduce(0) { $0 + (lengths[ObjectIdentifier($1)] ?? 0) } + spacing * CGFloat(max(0, subviews.count - 1))
+        let flexibleCount = subviews.filter { (lengths[ObjectIdentifier($0)] ?? 0) == 0 }.count
+        let flexible = flexibleCount > 0 ? max(0, total - fixed) / CGFloat(flexibleCount) : 0
+        var cursor: CGFloat = 0
+        for view in subviews {
+            let fixedLength = lengths[ObjectIdentifier(view)] ?? 0
+            let length = fixedLength > 0 ? fixedLength : flexible
+            view.frame = axis == .horizontal ? NSRect(x: cursor, y: 0, width: length, height: bounds.height) : NSRect(x: 0, y: cursor, width: bounds.width, height: length)
+            cursor += length + spacing
+        }
+    }
+    override func setFrameSize(_ newSize: NSSize) { super.setFrameSize(newSize); needsLayout = true }
 }
 
 final class ClosureMenuItem: NSMenuItem {
