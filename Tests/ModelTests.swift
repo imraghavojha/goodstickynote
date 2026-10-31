@@ -107,6 +107,16 @@ import AppKit
         // Cancelled debounced snapshots must not overwrite a synchronous final save.
         RunLoop.current.run(until: Date().addingTimeInterval(0.5))
         check(NoteStore(directory: directory).notes.isEmpty, "Cancelled delayed saves cannot overwrite the final commit")
+        // Hiding a blank note deletes it; whitespace counts as blank, files or text do not.
+        let blankStore = NoteStore(directory: directory.appendingPathComponent("Blank"))
+        var blankStack = StickyNote(); blankStack.text = "  \n "; blankStack.stackID = UUID()
+        var partner = StickyNote(); partner.text = "Keep"; partner.stackID = blankStack.stackID
+        var withFile = StickyNote(); withFile.attachments = [Attachment(name: "a.txt", storedName: "a.txt")]
+        blankStore.notes = [blankStack, partner, withFile]
+        blankStore.updateMany([blankStack.id, partner.id, withFile.id]) { $0.hidden = true }
+        check(blankStore.note(blankStack.id) == nil && blankStore.note(partner.id)?.hidden == true && blankStore.note(withFile.id) != nil, "Hidden blank notes are discarded; notes with text or files are kept")
+        check(blankStore.note(partner.id)?.stackID == nil, "Discarding a blank note dissolves a stack of one")
+        try blankStore.flush()
         let file = directory.appendingPathComponent("notes.json")
         let original = Data("not valid JSON".utf8); try original.write(to: file)
         let broken = NoteStore(directory: directory)

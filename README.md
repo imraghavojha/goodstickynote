@@ -28,11 +28,14 @@ The app is locally ad-hoc signed. Public distribution requires Developer ID sign
 
 - Click the menu bar icon for the compact **Notes** list. Right-click it for show/hide-all, bring-forward, preferences, and quit commands.
 - **⌃⌥N** creates and focuses a new note. Change the global shortcut in Preferences. Closing the list does not disable the shortcut.
+- Notes are flush and matte: no window shadow and no border, just the paper color.
 - Notes default to **220 × 180 points**. Drag the top-left grip to move one and the bottom-right grip to resize it down to **140 × 96**. Focus the resize grip and use arrow keys for keyboard resizing; Shift makes one-point changes.
 - Hover to copy, hide, attach files, change color/opacity, or open options. Copy briefly changes its icon to a checkmark. **⌘W** hides the active note or closes the active management window.
 - Choose from seven paper colors and 35–100% paper opacity. Text stays opaque. Low-opacity contrast depends on the wallpaper.
 - Drop files/pictures onto a note, paste copied files, or use its paperclip control. Regular files are copied into the library in a utility queue. Symlink targets are copied as independent files; folders and Finder aliases are rejected. An import spinner stays visible during copying; quitting during an import offers a visible wait state and cancellation. Image previews adapt to the space available and use bounded thumbnails. At small sizes, the paperclip menu keeps every attachment accessible. Click an attachment to open it; remove it from its menu.
-- **Options → Stack with…** combines notes. Named tabs or **⌃Tab / ⌃⇧Tab** switch notes. An overflow menu covers stacks that do not fit. Hiding affects the active note; pinning applies to the stack. **Remove this note from stack** separates it again.
+- Drag a note by its grip and drop it onto another note to stack them (the target shows a ring while you hover). **Options → Stack with…** does the same from a menu.
+- A stack shows iPhone-style page dots inside the bottom edge of the paper. Switch notes with a two-finger horizontal swipe (one note per swipe, like browser back/forward), a horizontal mouse-wheel flick, a click on a dot, or **⌃Tab / ⌃⇧Tab**. **Options → Notes in this stack** lists them all. Hiding affects the active note; pinning applies to the stack. **Remove this note from stack** separates it again.
+- Deleting: hidden notes have a trash button in the Notes list's **Hidden** tab that deletes immediately, without a confirmation. A blank note (no text, no files) is deleted automatically as soon as it is hidden. Only a visible note with content asks before deleting.
 - Notes normally stay at desktop level, across Spaces. Newly opened notes come forward for editing. **Keep above other apps** pins a note/stack; **Bring notes forward** temporarily raises all visible notes.
 
 The management list and preferences are created only when opened and released when closed. Notes remember their text, size, position, color, opacity, visibility, attachments, and stacks. Existing notes that still used the original oversized default are compacted once; custom sizes are preserved.

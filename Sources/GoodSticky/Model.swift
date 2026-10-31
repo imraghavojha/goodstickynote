@@ -42,6 +42,8 @@ struct StickyNote: Codable, Identifiable, Equatable {
         text.split(whereSeparator: \.isNewline).first.map(String.init) ?? "Untitled note"
     }
     var theme: NoteTheme { .get(themeID) }
+    /// No visible text and no files: hiding it would only leave clutter behind.
+    var isBlank: Bool { attachments.isEmpty && text.allSatisfy(\.isWhitespace) }
 }
 
 struct Preferences: Codable {
@@ -115,8 +117,9 @@ final class NoteStore {
         guard let index = notes.firstIndex(where: { $0.id == id }) else { return }
         body(&notes[index])
         notes[index].modified = Date()
+        let removed = discardBlankHidden([id])
         save()
-        if notify { onChange?() }
+        if notify || removed { onChange?() }
     }
     func updateMany(_ ids: [UUID], notify: Bool = true, _ body: (inout StickyNote) -> Void) {
         let selected = Set(ids)
@@ -126,8 +129,15 @@ final class NoteStore {
             body(&notes[index]); notes[index].modified = now; changed = true
         }
         guard changed else { return }
+        let removed = discardBlankHidden(selected)
         save()
-        if notify { onChange?() }
+        if notify || removed { onChange?() }
+    }
+    /// Blank notes are deleted as soon as they are hidden; there is nothing to keep.
+    @discardableResult func discardBlankHidden(_ ids: Set<UUID>? = nil) -> Bool {
+        let doomed = notes.filter { $0.hidden && $0.isBlank && ids?.contains($0.id) != false }.map(\.id)
+        doomed.forEach(remove)
+        return !doomed.isEmpty
     }
     @discardableResult func add(text: String = "", theme: String? = nil) -> StickyNote {
         var note = StickyNote()
@@ -146,6 +156,12 @@ final class NoteStore {
         return note
     }
     func delete(_ id: UUID) {
+        guard note(id) != nil else { return }
+        remove(id)
+        save()
+        onChange?()
+    }
+    private func remove(_ id: UUID) {
         guard let note = note(id) else { return }
         notes.removeAll { $0.id == id }
         if let stack = note.stackID {
@@ -153,8 +169,6 @@ final class NoteStore {
             if remaining.count == 1 { notes[remaining[0]].stackID = nil }
         }
         pendingFileDeletions.formUnion(note.attachments.map(\.storedName))
-        save()
-        onChange?()
     }
     func attachmentURL(_ attachment: Attachment) -> URL {
         directory.appendingPathComponent("Attachments").appendingPathComponent(attachment.storedName)

@@ -8,9 +8,13 @@ final class StickyPanel: NSPanel {
 }
 
 /// The paper is drawn entirely with layer properties, so a note owns no full-size bitmap.
+/// Notes are flush and matte: no window shadow and no border. A ring appears only as
+/// transient feedback while files or another note are dragged onto this one.
 final class WidgetSurface: NSView {
     var theme = NoteTheme.all[0] { didSet { needsDisplay = true } }
     var paperOpacity: CGFloat = 1 { didSet { needsDisplay = true } }
+    var stackTarget = false { didSet { if oldValue != stackTarget { needsDisplay = true } } }
+    var onSwipe: ((Int) -> Void)?
     var onHover: ((Bool) -> Void)?
     var onDrop: (([URL]) -> Void)?
     var onLayout: (() -> Void)?
@@ -29,8 +33,13 @@ final class WidgetSurface: NSView {
         guard let layer else { return }
         layer.cornerRadius = 8; layer.cornerCurve = .continuous
         layer.backgroundColor = theme.paper.withAlphaComponent(paperOpacity).cgColor
-        layer.borderColor = theme.ink.withAlphaComponent(dropping ? 0.6 : 0.12).cgColor
-        layer.borderWidth = dropping ? 2 : 1
+        let ring = dropping || stackTarget
+        layer.borderColor = ring ? theme.ink.withAlphaComponent(0.55).cgColor : nil
+        layer.borderWidth = ring ? 2 : 0
+    }
+    override func swipe(with event: NSEvent) {
+        // Three-finger "swipe between pages" delivers discrete swipe events.
+        if event.deltaX != 0 { onSwipe?(event.deltaX > 0 ? -1 : 1) } else { super.swipe(with: event) }
     }
     override func updateTrackingAreas() {
         super.updateTrackingAreas()
@@ -85,9 +94,124 @@ final class DragHandle: ShapeMarkView {
         for index in 0..<3 { path.addEllipse(in: CGRect(x: 10 + CGFloat(index) * 3.5, y: 12, width: 2, height: 2)) }
         return path
     }
+    /// Screen-space cursor location while moving, and when released.
+    var onMove: ((NSPoint) -> Void)?
+    var onRelease: ((NSPoint) -> Void)?
+    private var start: NSPoint?
+    private var origin = NSPoint.zero
     override func resetCursorRects() { addCursorRect(bounds, cursor: .openHand) }
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
-    override func mouseDown(with event: NSEvent) { window?.performDrag(with: event) }
+    override func mouseDown(with event: NSEvent) {
+        guard let window else { return }
+        start = NSEvent.mouseLocation; origin = window.frame.origin
+        NSCursor.closedHand.push()
+    }
+    override func mouseDragged(with event: NSEvent) {
+        guard let window, let start else { return }
+        let mouse = NSEvent.mouseLocation
+        window.setFrameOrigin(NSPoint(x: (origin.x + mouse.x - start.x).rounded(), y: (origin.y + mouse.y - start.y).rounded()))
+        onMove?(mouse)
+    }
+    override func mouseUp(with event: NSEvent) {
+        guard start != nil else { return }
+        start = nil; NSCursor.pop()
+        onRelease?(NSEvent.mouseLocation)
+    }
+}
+
+/// iPhone-style page dots for a stack, drawn inside the paper. One shape layer per state.
+final class PageDots: NSView {
+    var count = 0 { didSet { if oldValue != count { rebuild() } } }
+    var current = 0 { didSet { if oldValue != current { rebuild() } } }
+    var tint = NSColor.gray { didSet { rebuild() } }
+    var titles: [String] = [] { didSet { rebuild() } }
+    var onSelect: ((Int) -> Void)?
+    private let inactive = CAShapeLayer(), active = CAShapeLayer()
+    private(set) var range = 0..<0
+    static let diameter: CGFloat = 6, pitch: CGFloat = 12
+    override init(frame: NSRect) {
+        super.init(frame: frame)
+        wantsLayer = true; layer?.addSublayer(inactive); layer?.addSublayer(active)
+        setAccessibilityElement(true); setAccessibilityRole(.tabGroup)
+    }
+    required init?(coder: NSCoder) { fatalError() }
+    override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
+    override func setFrameSize(_ newSize: NSSize) { super.setFrameSize(newSize); rebuild() }
+    /// Index range that fits, centered on the current note when a stack is very large.
+    private func visibleRange() -> Range<Int> {
+        let capacity = max(1, Int(bounds.width / Self.pitch))
+        guard count > capacity else { return 0..<count }
+        let first = min(max(0, current - capacity / 2), count - capacity)
+        return first..<(first + capacity)
+    }
+    private func originX(_ slot: Int) -> CGFloat {
+        let used = CGFloat(range.count) * Self.pitch
+        return (bounds.width - used) / 2 + CGFloat(slot) * Self.pitch
+    }
+    func rebuild() {
+        range = visibleRange()
+        let rest = CGMutablePath(), on = CGMutablePath()
+        for (slot, index) in range.enumerated() {
+            // Edge dots shrink when the stack continues beyond the visible window.
+            let edge = (slot == 0 && range.lowerBound > 0) || (slot == range.count - 1 && range.upperBound < count)
+            let d = edge ? Self.diameter - 2 : Self.diameter
+            let rect = CGRect(x: originX(slot) + (Self.pitch - d) / 2, y: (bounds.height - d) / 2, width: d, height: d)
+            (index == current ? on : rest).addEllipse(in: rect)
+        }
+        CATransaction.begin(); CATransaction.setDisableActions(true)
+        inactive.frame = bounds; active.frame = bounds
+        inactive.path = rest; active.path = on
+        inactive.fillColor = tint.withAlphaComponent(0.28).cgColor
+        active.fillColor = tint.withAlphaComponent(0.8).cgColor
+        CATransaction.commit()
+        let title = titles.indices.contains(current) ? titles[current] : ""
+        setAccessibilityLabel("Stacked notes"); setAccessibilityValue("Note \(current + 1) of \(count)\(title.isEmpty ? "" : ", " + title)")
+        toolTip = count > 1 ? "Note \(current + 1) of \(count) · swipe or ⌃Tab to switch" : nil
+    }
+    func index(at point: NSPoint) -> Int? {
+        let slot = Int(floor((point.x - originX(0)) / Self.pitch))
+        guard slot >= 0, slot < range.count else { return nil }
+        return range.lowerBound + slot
+    }
+    override func mouseDown(with event: NSEvent) {
+        if let index = index(at: convert(event.locationInWindow, from: nil)) { onSelect?(index) }
+    }
+    override func accessibilityPerformIncrement() -> Bool { onSelect?((current + 1) % max(1, count)); return true }
+    override func accessibilityPerformDecrement() -> Bool { onSelect?((current - 1 + count) % max(1, count)); return true }
+}
+
+/// Turns a horizontal two-finger trackpad swipe (or a horizontal wheel flick) into one
+/// switch per gesture, like back/forward in a browser. Vertical scrolling is untouched.
+final class NoteScrollView: NSScrollView {
+    var canSwipe: () -> Bool = { false }
+    var onSwipe: ((Int) -> Void)?
+    private var horizontal: Bool?
+    private var travel: CGFloat = 0
+    private var fired = false
+    private var lastDiscrete = Date.distantPast
+    static let threshold: CGFloat = 56
+    override func scrollWheel(with event: NSEvent) {
+        guard canSwipe() else { super.scrollWheel(with: event); return }
+        // Physical finger direction, independent of the natural-scrolling setting.
+        let dx = event.isDirectionInvertedFromDevice ? event.scrollingDeltaX : -event.scrollingDeltaX
+        if !event.hasPreciseScrollingDeltas {
+            guard abs(event.scrollingDeltaX) > abs(event.scrollingDeltaY), event.scrollingDeltaX != 0 else { super.scrollWheel(with: event); return }
+            if Date().timeIntervalSince(lastDiscrete) > 0.4 { lastDiscrete = Date(); onSwipe?(dx > 0 ? -1 : 1) }
+            return
+        }
+        if event.phase.contains(.began) || event.phase.contains(.mayBegin) { horizontal = nil; travel = 0; fired = false }
+        if event.momentumPhase.isEmpty && !event.phase.isEmpty && horizontal == nil {
+            let x = abs(event.scrollingDeltaX), y = abs(event.scrollingDeltaY)
+            if x + y > 0.5 { horizontal = x > y * 1.3 }
+        }
+        guard horizontal == true else { super.scrollWheel(with: event); return }
+        // Horizontal gestures, including their momentum tail, never reach the text view.
+        if event.momentumPhase.isEmpty {
+            travel += dx
+            if !fired && abs(travel) >= Self.threshold { fired = true; onSwipe?(travel > 0 ? -1 : 1) }
+        }
+        if event.momentumPhase.contains(.ended) || event.momentumPhase.contains(.cancelled) || (event.momentumPhase.isEmpty && (event.phase.contains(.cancelled))) { horizontal = nil }
+    }
 }
 
 final class NoteTextView: NSTextView {
@@ -188,9 +312,8 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
     var activeID: UUID { didSet { if oldValue != activeID { textView.undoManager?.removeAllActions() } } }
     let surface = WidgetSurface(frame: .zero)
     let textView = NoteTextView(frame: .zero)
-    let scroll = NSScrollView()
+    let scroll = NoteScrollView()
     let handle = DragHandle()
-    let caption = label("", size: 10, weight: .medium)
     /// Hover controls are built on first hover/focus; most desktop notes never need them.
     private(set) var controls: FrameStack?
     private var copyButton: ActionButton?
@@ -198,13 +321,13 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
     private var importSpinner: NSProgressIndicator?
     private var hovering = false
     let attachments = FrameStack(.vertical, spacing: 4)
-    let tabs = FrameStack(.horizontal, spacing: 4)
+    let dots = PageDots(frame: .zero)
     let grip = ResizeGrip(frame: .zero)
     private var appearancePopover: NSPopover?
     private var attachmentKey = ""
     private var failedPreviewIDs = Set<UUID>()
     private var importsInProgress = 0
-    private var tabCapacity = 0
+    private weak var stackTarget: WidgetController?
     private var configuring = false
     private var layingOut = false
     private var transientFront = false
@@ -218,7 +341,7 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         super.init(window: panel)
         configuring = true
         panel.delegate = self
-        panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = true
+        panel.isOpaque = false; panel.backgroundColor = .clear; panel.hasShadow = false
         panel.hidesOnDeactivate = false; panel.isReleasedWhenClosed = false
         panel.collectionBehavior = [.canJoinAllSpaces, .stationary, .ignoresCycle]
         panel.minSize = NSSize(width: 140, height: 96)
@@ -235,8 +358,9 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
     }
     required init?(coder: NSCoder) { fatalError() }
     func setup() {
-        surface.addSubview(handle); handle.toolTip = "Drag to move"
-        surface.addSubview(caption)
+        surface.addSubview(handle); handle.toolTip = "Drag to move · drop on another note to stack"
+        handle.onMove = { [weak self] point in self?.trackStackTarget(at: point) }
+        handle.onRelease = { [weak self] point in self?.finishMove(at: point) }
         scroll.drawsBackground = false; scroll.borderType = .noBorder
         scroll.hasVerticalScroller = true; scroll.autohidesScrollers = true
         textView.allowsUndo = true; textView.isRichText = false; textView.drawsBackground = false
@@ -248,12 +372,16 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         // Text checking services load lazily, only while a note is being edited.
         setEditingServices(false)
         textView.onFiles = { [weak self] in self?.addFiles($0) }
-        textView.onCycle = { [weak self] direction in
-            guard let self, let index = self.ids.firstIndex(of: self.activeID), self.ids.count > 1 else { return }
-            self.activeID = self.ids[(index + direction + self.ids.count) % self.ids.count]; self.refresh()
+        textView.onCycle = { [weak self] direction in self?.cycle(direction) }
+        scroll.canSwipe = { [weak self] in (self?.ids.count ?? 0) > 1 }
+        scroll.onSwipe = { [weak self] direction in self?.cycle(direction) }
+        surface.onSwipe = { [weak self] direction in self?.cycle(direction) }
+        dots.onSelect = { [weak self] index in
+            guard let self, self.ids.indices.contains(index) else { return }
+            self.select(self.ids[index])
         }
         scroll.documentView = textView; surface.addSubview(scroll)
-        surface.addSubview(attachments); surface.addSubview(tabs); surface.addSubview(grip)
+        surface.addSubview(attachments); surface.addSubview(dots); surface.addSubview(grip)
         surface.onHover = { [weak self] hovering in
             guard let self else { return }
             self.hovering = hovering; self.updateControlsVisibility()
@@ -302,10 +430,48 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         guard textView.isContinuousSpellCheckingEnabled != editing else { return }
         textView.isContinuousSpellCheckingEnabled = editing
     }
-    func refreshCaption() { caption.stringValue = ids.count > 1 ? "\(ids.count) notes" : "" }
+    /// Switches the visible note in a stack, sliding in the direction of travel.
+    func select(_ id: UUID, direction: Int? = nil) {
+        guard id != activeID, let from = ids.firstIndex(of: activeID), let to = ids.firstIndex(of: id) else { return }
+        let transition = CATransition()
+        transition.type = .push; transition.duration = 0.18
+        transition.subtype = (direction ?? (to > from ? 1 : -1)) > 0 ? .fromRight : .fromLeft
+        transition.timingFunction = CAMediaTimingFunction(name: .easeOut)
+        surface.layer?.add(transition, forKey: "switch")
+        activeID = id; refresh()
+    }
+    func cycle(_ direction: Int) {
+        guard ids.count > 1, let index = ids.firstIndex(of: activeID) else { return }
+        select(ids[(index + direction + ids.count) % ids.count], direction: direction)
+    }
+    func refreshDots() {
+        dots.count = ids.count
+        dots.current = ids.firstIndex(of: activeID) ?? 0
+        dots.titles = ids.map { store.note($0)?.title ?? "Untitled note" }
+    }
+    /// The note directly beneath the cursor (under the one being dragged), as WindowServer
+    /// orders windows. A note covered by another app's window is never a target.
+    func stackCandidate(at point: NSPoint) -> WidgetController? {
+        guard let window else { return nil }
+        var number = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: 0)
+        if number == window.windowNumber { number = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: number) }
+        return AppDelegate.shared.widgets.values.first { $0 !== self && $0.window?.windowNumber == number && $0.window?.isVisible == true }
+    }
+    func trackStackTarget(at point: NSPoint) {
+        let candidate = stackCandidate(at: point)
+        guard candidate !== stackTarget else { return }
+        stackTarget?.surface.stackTarget = false
+        candidate?.surface.stackTarget = true
+        stackTarget = candidate
+    }
+    func finishMove(at point: NSPoint) {
+        let target = stackCandidate(at: point)
+        stackTarget?.surface.stackTarget = false; stackTarget = nil
+        guard let target else { return }
+        AppDelegate.shared.stack(activeID, with: target.activeID)
+    }
     func refresh(using supplied: StickyNote? = nil) {
         guard let note = supplied ?? self.note, note != lastRenderedNote else { return }
-        let previous = lastRenderedNote
         lastRenderedNote = note; configuring = true
         window?.title = note.title
         surface.theme = note.theme; surface.paperOpacity = note.opacity
@@ -314,15 +480,14 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         let paragraph = NSMutableParagraphStyle(); paragraph.lineSpacing = 2
         textView.defaultParagraphStyle = paragraph
         textView.typingAttributes = [.font: NSFont.systemFont(ofSize: 13), .foregroundColor: note.theme.ink, .paragraphStyle: paragraph]
-        caption.textColor = note.theme.ink.withAlphaComponent(0.85)
         handle.tint = note.theme.ink
         grip.tint = note.theme.ink
+        if dots.tint != note.theme.ink { dots.tint = note.theme.ink }
         styleControls()
-        refreshCaption()
+        refreshDots()
         if note.pinned { window?.level = .floating }
         else if !transientFront && !groupRaised && window?.isKeyWindow != true && appearancePopover?.isShown != true && window?.attachedSheet == nil { setLevel() }
         failedPreviewIDs.formIntersection(Set(note.attachments.map(\.id)))
-        if previous?.id != note.id || previous?.themeID != note.themeID { tabCapacity = 0 }
         configuring = false; layoutNote()
     }
     func layoutNote() {
@@ -332,16 +497,13 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         guard width > 0, height > 0 else { return }
         handle.frame = NSRect(x: 0, y: height - 27, width: max(24, width - 112), height: 27)
         controls?.frame = NSRect(x: width - 111, y: height - 25, width: 105, height: 22)
-        caption.isHidden = width < 245
-        caption.frame = NSRect(x: 12, y: height - 22, width: max(0, width - 130), height: 15)
         grip.frame = NSRect(x: width - 17, y: 0, width: 17, height: 17)
-        let capacity = max(1, min(4, Int((width - 55) / 56)))
-        if capacity != tabCapacity { tabCapacity = capacity; rebuildTabs() }
-        let tabHeight: CGFloat = ids.count > 1 ? 22 : 0
+        let stacked = ids.count > 1
         var bottom: CGFloat = 9
-        tabs.isHidden = tabHeight == 0
-        tabs.frame = NSRect(x: 12, y: bottom, width: max(0, width - 32), height: tabHeight)
-        if tabHeight > 0 { bottom += tabHeight + 5 }
+        dots.isHidden = !stacked
+        // Dots sit centered inside the paper's bottom edge, clear of the resize grip.
+        dots.frame = NSRect(x: 22, y: 3, width: max(0, width - 44), height: 14)
+        if stacked { bottom = 19 }
         let budget = max(0, height - 28 - bottom - 48)
         let hasPreview = note.attachments.contains { !failedPreviewIDs.contains($0.id) && UTType(filenameExtension: URL(fileURLWithPath: $0.name).pathExtension)?.conforms(to: .image) == true }
         let previewHeight: CGFloat = !hasPreview ? 0 : height >= 240 && budget >= 94 ? 64 : height >= 180 && budget >= 70 ? 40 : 0
@@ -363,7 +525,7 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         let sameEditor = members.contains(activeID)
         ids = members
         if !sameEditor { activeID = members[0]; lastRenderedNote = nil }
-        tabCapacity = 0; refreshCaption()
+        refreshDots()
         if let note, let frame = window?.frame {
             let desired = NSRect(x: note.x, y: note.y, width: note.width, height: note.height)
             if frame != desired { configuring = true; window?.setFrame(desired, display: true); configuring = false }
@@ -470,34 +632,6 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
             row.addArrangedSubview(file); row.addArrangedSubview(remove, length: 18); attachments.addArrangedSubview(row, length: 22)
         }
     }
-    func rebuildTabs() {
-        tabs.removeAllArrangedSubviews()
-        guard ids.count > 1 else { return }
-        var displayed = Array(ids.prefix(tabCapacity))
-        if !displayed.contains(activeID) { displayed[displayed.count - 1] = activeID }
-        for id in displayed {
-            let title = store.note(id)?.title ?? "Untitled note"
-            let button = ActionButton(title) { [weak self] in self?.activeID = id; self?.refresh() }
-            button.toolTip = title + " · ⌃Tab"; button.font = .systemFont(ofSize: 10)
-            button.lineBreakMode = .byTruncatingTail; button.contentTintColor = note?.theme.ink
-            button.setAccessibilityRole(.radioButton); button.setAccessibilityValue(id == activeID ? 1 : 0)
-            button.wantsLayer = true; button.layer?.cornerRadius = 4
-            button.layer?.backgroundColor = id == activeID ? note?.theme.ink.withAlphaComponent(0.14).cgColor : NSColor.clear.cgColor
-            tabs.addArrangedSubview(button, length: 52)
-        }
-        if ids.count > displayed.count {
-            let more = ActionButton("More notes", symbol: "ellipsis") { [weak self] in
-                guard let self else { return }
-                let menu = NSMenu()
-                for id in self.ids {
-                    let item = ClosureMenuItem(self.store.note(id)?.title ?? "Untitled note") { [weak self] in self?.activeID = id; self?.refresh() }
-                    item.state = id == self.activeID ? .on : .off; menu.addItem(item)
-                }
-                menu.popUp(positioning: nil, at: NSPoint(x: 12, y: 28), in: self.surface)
-            }
-            more.contentTintColor = note?.theme.ink; tabs.addArrangedSubview(more, length: 22)
-        }
-    }
     func showAppearance() {
         let controller = NoteAppearanceController(noteID: activeID)
         let popover = NSPopover(); popover.delegate = self; popover.behavior = .transient; popover.contentViewController = controller
@@ -527,6 +661,12 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         item(note.pinned ? "Keep on desktop" : "Keep above other apps") { [weak self] in guard let self else { return }; AppDelegate.shared.setPinned(self.activeID, pinned: !note.pinned) }
         menu.addItem(.separator())
         if ids.count > 1 {
+            let notesMenu = NSMenu()
+            for id in ids {
+                let choice = ClosureMenuItem(String((store.note(id)?.title ?? "Untitled note").prefix(40))) { [weak self] in self?.select(id) }
+                choice.state = id == activeID ? .on : .off; notesMenu.addItem(choice)
+            }
+            let notesItem = NSMenuItem(title: "Notes in this stack", action: nil, keyEquivalent: ""); notesItem.submenu = notesMenu; menu.addItem(notesItem)
             item("Remove this note from stack") { [weak self] in guard let self else { return }; AppDelegate.shared.unstack(self.activeID) }
         }
         let stackMenu = NSMenu()
@@ -547,7 +687,7 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         }
         item("All notes…") { AppDelegate.shared.showLibrary() }
         menu.addItem(.separator())
-        item("Delete note…") { [weak self] in guard let self else { return }; AppDelegate.shared.confirmDelete(self.activeID) }
+        item(note.isBlank ? "Delete note" : "Delete note…") { [weak self] in guard let self else { return }; AppDelegate.shared.confirmDelete(self.activeID) }
         menu.popUp(positioning: nil, at: NSPoint(x: surface.bounds.width - 30, y: surface.bounds.height - 40), in: surface)
     }
 }

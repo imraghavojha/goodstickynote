@@ -79,7 +79,7 @@ final class LibraryController: NSWindowController, NSSearchFieldDelegate, NSWind
         count.stringValue = store.notes.isEmpty ? "No notes yet" : "\(visible) on desktop · \(hidden) hidden"
         hint.stringValue = "\(HotKeyManager.display(store.preferences)) creates a note from anywhere"
         if !query.isEmpty { empty.configure(symbol: "magnifyingglass", title: "No matches", detail: "Nothing matches “\(query)”.") }
-        else if filter.selectedSegment == 1 { empty.configure(symbol: "eye.slash", title: "No hidden notes", detail: "Notes you hide are kept here.") }
+        else if filter.selectedSegment == 1 { empty.configure(symbol: "eye.slash", title: "No hidden notes", detail: "Notes you hide are kept here. Empty notes are deleted when hidden.") }
         else { empty.configure(symbol: "note.text", title: "Your desktop is clear", detail: "Click New Note or press \(HotKeyManager.display(store.preferences)).") }
         empty.isHidden = !cards.isEmpty
         layoutRows()
@@ -135,6 +135,8 @@ final class NoteCard: NSView {
     private var tracking: NSTrackingArea?
     private var hovering = false
     private var buttons: [IconButton] = []
+    /// Hidden notes keep a one-click delete visible at all times; no confirmation.
+    private(set) var deleteButton: IconButton?
     private static let relative: RelativeDateTimeFormatter = { let f = RelativeDateTimeFormatter(); f.unitsStyle = .short; return f }()
     init(note: StickyNote?) {
         self.note = note; super.init(frame: .zero)
@@ -154,8 +156,15 @@ final class NoteCard: NSView {
             NSAccessibilityCustomAction(name: note.hidden ? "Show" : "Hide") { hide.actionHandler?(); return true },
             NSAccessibilityCustomAction(name: "Delete") { AppDelegate.shared.confirmDelete(note.id); return true }
         ])
-        for button in [more, copy, hide] {
-            button.isHidden = true; addSubview(button); buttons.append(button)
+        var all = [more, copy, hide]
+        if note.hidden {
+            let trash = IconButton("Delete now", symbol: "trash", size: 13) { NoteStore.shared.delete(note.id) }
+            trash.contentTintColor = .systemRed
+            trash.setAccessibilityHelp("Permanently deletes this hidden note without asking.")
+            deleteButton = trash; all.insert(trash, at: 0)
+        }
+        for button in all {
+            button.isHidden = button !== deleteButton; addSubview(button); buttons.append(button)
             button.focusChanged = { [weak self] focused in
                 if focused { self?.showControls(true) }
                 else { DispatchQueue.main.async { [weak self] in self?.updateControls() } }
@@ -168,7 +177,7 @@ final class NoteCard: NSView {
     override func drawFocusRingMask() { NSBezierPath(roundedRect: bounds, xRadius: 10, yRadius: 10).fill() }
     override func becomeFirstResponder() -> Bool { showControls(true); return true }
     override func resignFirstResponder() -> Bool { DispatchQueue.main.async { [weak self] in self?.updateControls() }; return true }
-    func showControls(_ show: Bool) { buttons.forEach { $0.isHidden = !show }; needsDisplay = true }
+    func showControls(_ show: Bool) { buttons.forEach { $0.isHidden = !show && $0 !== deleteButton }; needsDisplay = true }
     func updateControls() {
         let focus = window?.firstResponder as? NSView
         showControls(hovering || focus === self || focus?.isDescendant(of: self) == true)
@@ -217,7 +226,7 @@ final class NoteCard: NSView {
             hide.image = symbol("eye.slash", size: 12); menu.addItem(hide)
         }
         menu.addItem(.separator())
-        let delete = ClosureMenuItem("Delete…") { AppDelegate.shared.confirmDelete(note.id) }
+        let delete = ClosureMenuItem(note.hidden || note.isBlank ? "Delete" : "Delete…") { AppDelegate.shared.confirmDelete(note.id) }
         delete.image = symbol("trash", size: 12); menu.addItem(delete)
         return menu
     }
@@ -264,7 +273,8 @@ final class NoteCard: NSView {
         let dark = effectiveAppearance.bestMatch(from: [.darkAqua, .aqua]) == .darkAqua
         let secondaryInk = NSColor(calibratedWhite: dark ? 0.82 : 0.35, alpha: 1)
         let tertiaryInk = NSColor(calibratedWhite: dark ? 0.73 : 0.43, alpha: 1)
-        let available = bounds.width - textX - (buttons.first?.isHidden == false ? 104 : 12)
+        let shown = buttons.filter { !$0.isHidden }.count
+        let available = bounds.width - textX - (shown > 0 ? CGFloat(shown) * 30 + 14 : 12)
         let style = NSMutableParagraphStyle(); style.lineBreakMode = .byTruncatingTail
         let title = note.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Empty note" : note.title
         (title as NSString).draw(in: NSRect(x: textX, y: bounds.height - 29, width: available, height: 18), withAttributes: [.font: NSFont.systemFont(ofSize: 13, weight: .semibold), .foregroundColor: note.text.isEmpty ? secondaryInk : primaryInk, .paragraphStyle: style])
