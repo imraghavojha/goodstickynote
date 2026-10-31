@@ -143,31 +143,82 @@ extension AppDelegate {
             hiddenCard?.deleteButton?.actionHandler?()
             let hiddenDeleted = trashVisible && store.note(kept.id) == nil
             library?.close()
-            // Dropping one note's drag handle onto another stacks them.
+            // Notes overlap freely; only a note dropped squarely on top of another stacks.
             let lower = store.add(text: "Drop target"), upper = store.add(text: "Dragged note")
             store.updateMany([lower.id, upper.id]) { $0.pinned = true }
             let target = widgets[lower.id.uuidString]!, dragged = widgets[upper.id.uuidString]!
             let screen = (NSScreen.main ?? NSScreen.screens[0]).visibleFrame
             target.window?.setFrame(NSRect(x: screen.minX + 80, y: screen.minY + 80, width: 220, height: 180), display: true)
             dragged.window?.setFrame(NSRect(x: screen.minX + 420, y: screen.minY + 80, width: 220, height: 180), display: true)
-            // Float both so no other app's window covers the drop point, then move the dragged
-            // note so its handle is under the cursor above the target, as in a real drag.
             target.window?.level = .floating; dragged.window?.level = .floating
-            target.window?.orderFrontRegardless(); dragged.window?.orderFrontRegardless()
-            let dropPoint = NSPoint(x: target.window!.frame.midX, y: target.window!.frame.midY)
-            dragged.window?.setFrameOrigin(NSPoint(x: dropPoint.x - 40, y: dropPoint.y - 166))
-            // Let WindowServer apply the new frames and ordering, as between real drag events.
-            CATransaction.flush(); RunLoop.current.run(until: Date().addingTimeInterval(0.3))
-            dragged.trackStackTarget(at: dropPoint)
-            let highlighted = target.surface.stackTarget
-            if !highlighted {
-                let hit = NSWindow.windowNumber(at: dropPoint, belowWindowWithWindowNumber: 0)
-                let below = NSWindow.windowNumber(at: dropPoint, belowWindowWithWindowNumber: hit)
-                print("Drop probe: hit=\(hit) below=\(below) target=\(target.window!.windowNumber) dragged=\(dragged.window!.windowNumber) point=\(dropPoint)"); fflush(stdout)
+            target.window?.orderFrontRegardless(); dragged.beginMove()
+            func drag(to origin: NSPoint) {
+                dragged.window?.setFrameOrigin(origin)
+                // Let WindowServer apply the new frames and ordering, as between real drag events.
+                CATransaction.flush(); RunLoop.current.run(until: Date().addingTimeInterval(0.1))
+                dragged.trackDrag(at: NSPoint(x: origin.x + 40, y: origin.y + 166))
             }
-            dragged.finishMove(at: dropPoint)
-            let dropStacked = highlighted && !target.surface.stackTarget && store.note(lower.id)?.stackID != nil && store.note(lower.id)?.stackID == store.note(upper.id)?.stackID
+            let base = target.window!.frame.origin
+            drag(to: NSPoint(x: base.x + 110, y: base.y + 30))
+            let overlapOnly = !target.surface.stackTarget
+            drag(to: NSPoint(x: base.x + 10, y: base.y - 8))
+            let armed = target.surface.stackTarget && dragged.surface.layer?.animation(forKey: "stackArm") != nil
+            drag(to: NSPoint(x: base.x + 150, y: base.y))
+            let disarmed = !target.surface.stackTarget
+            drag(to: NSPoint(x: base.x + 6, y: base.y + 4))
+            let highlighted = target.surface.stackTarget
+            let releasePoint = NSPoint(x: dragged.window!.frame.minX + 40, y: dragged.window!.frame.minY + 166)
+            dragged.finishMove(at: releasePoint)
+            let dropStacked = overlapOnly && armed && disarmed && highlighted && !target.surface.stackTarget && store.note(lower.id)?.stackID != nil && store.note(lower.id)?.stackID == store.note(upper.id)?.stackID
             store.delete(lower.id); store.delete(upper.id)
+            // Swiping past the last note adds a page; leaving a blank page discards it.
+            let page = store.add(text: "First page")
+            let pageWidget = widgets[page.id.uuidString]!
+            pageWidget.cycle(1, extending: true)
+            let swipeAdds = store.note(page.id)?.stackID.flatMap { widgets[$0.uuidString] } === pageWidget && pageWidget.ids.count == 2 && pageWidget.activeID != page.id && store.note(pageWidget.activeID)?.isBlank == true
+            pageWidget.cycle(1, extending: true)
+            let blankNotRepeated = pageWidget.ids.count == 2
+            pageWidget.cycle(-1, extending: true)
+            let blankPageDiscarded = swipeAdds && blankNotRepeated && pageWidget.ids == [page.id] && store.note(page.id)?.stackID == nil && widgets[page.id.uuidString] === pageWidget
+            pageWidget.window?.resignKey()
+            store.delete(page.id)
+            // Side notes: tucked into the edge as a tab, slid out on demand, tucked away again.
+            let side = store.add(text: "Side note")
+            let sideWidget = widgets[side.id.uuidString]!
+            let sideScreen = sideWidget.window?.screen ?? NSScreen.main!
+            let edgePoint = NSPoint(x: sideScreen.frame.maxX - 1, y: sideScreen.frame.midY)
+            let rightIsOuter = !NSScreen.screens.contains { $0 !== sideScreen && $0.frame.minX >= sideScreen.frame.maxX - 1 && $0.frame.minY <= edgePoint.y && $0.frame.maxY >= edgePoint.y }
+            let edgeDetected = !rightIsOuter || sideWidget.dockEdge(at: edgePoint, frame: sideWidget.window!.frame) == .right
+            let notEdge = sideWidget.dockEdge(at: NSPoint(x: sideScreen.frame.midX, y: sideScreen.frame.midY), frame: NSRect(x: sideScreen.frame.midX, y: sideScreen.frame.midY, width: 220, height: 180)) == nil
+            sideWidget.dock(to: .right, at: edgePoint)
+            // The remaining checks wait on real timers from the top-level run loop, so nested
+            // run loops never hold AppKit's pending autorelease work (see checkUndoHistory).
+            WidgetController.after(0.4) { [self] in
+            let edgeX = sideScreen.visibleFrame.maxX
+            let tucked = sideWidget.collapsed && sideWidget.window?.isVisible == false && sideWidget.tab?.isVisible == true && sideWidget.tab?.frame.maxX == edgeX && store.note(side.id)?.dock == "right"
+            sideWidget.expand()
+            let slidOut = !sideWidget.collapsed && sideWidget.window?.isVisible == true && sideWidget.window?.frame.maxX == edgeX && sideWidget.tab?.isVisible == false && sideWidget.window?.level == .floating
+            let pointerAway = !(sideWidget.window?.frame.insetBy(dx: -6, dy: -6).contains(NSEvent.mouseLocation) ?? true)
+            WidgetController.after(0.9) { [self] in
+            let autoTucked = !pointerAway || (sideWidget.collapsed && sideWidget.window?.isVisible == false)
+            sideWidget.expand(); sideWidget.undock()
+            let undocked = store.note(side.id)?.dock == nil && !sideWidget.collapsed && sideWidget.tab == nil && sideWidget.window?.isVisible == true
+            let sideNotes = edgeDetected && notEdge && tucked && slidOut && autoTucked && undocked
+            if !sideNotes { print("Side notes: edge=\(edgeDetected) notEdge=\(notEdge) tucked=\(tucked) slidOut=\(slidOut) autoTucked=\(autoTucked) undocked=\(undocked)") }
+            store.delete(side.id)
+            // Snooze: the snooze button sits next to copy; a snoozed note returns by itself.
+            let napper = store.add(text: "Nap")
+            let napWidget = widgets[napper.id.uuidString]!
+            napWidget.ensureControls()
+            let snoozeButton = (napWidget.controls?.arrangedSubviews.map(\.toolTip) ?? []).prefix(2) == ["Copy note", "Snooze note"]
+            napWidget.snooze(until: Date().addingTimeInterval(0.3))
+            let snoozed = store.note(napper.id)?.hidden == true && store.note(napper.id)?.snoozedUntil != nil && widgets[napper.id.uuidString] == nil
+            WidgetController.after(2.8) { [self] in
+            let woke = store.note(napper.id)?.hidden == false && store.note(napper.id)?.snoozedUntil == nil && widgets[napper.id.uuidString]?.window?.level == .floating
+            returnNotesToDesktop()
+            let snooze = snoozeButton && snoozed && woke
+            if !snooze { print("Snooze: button=\(snoozeButton) snoozed=\(snoozed) woke=\(woke)") }
+            store.delete(napper.id)
             // Editors are created on demand and released back to the cheap display.
             let solo = store.add(text: "Solo")
             let soloWidget = widgets[solo.id.uuidString]!
@@ -178,10 +229,11 @@ extension AppDelegate {
             let editorRoundTrip = idleWithoutEditor && soloWidget.textView == nil && !soloWidget.display.isHidden && soloWidget.display.text == "Solo edited" && store.note(solo.id)?.text == "Solo edited"
             store.delete(solo.id)
             do { try store.flush() } catch { preconditionFailure("Smoke save failed: \(error)") }
-            print("SMOKE TEST: stacked=\(stacked) hidden=\(hidden) restored=\(restored) unstacked=\(unstacked) minimumLayout=\(minimumLayout) resizeGesture=\(resizeGesture) sharedPin=\(sharedPin) allRaised=\(allRaised) tabsAccessible=\(tabsAccessible) keyboardCycle=\(keyboardCycle) focusedControls=\(cardFocused && focusedControls) staysAfterClosingUI=\(staysAfterClosingUI) activeTabPreserved=\(activeTabPreserved) quitWaitVisible=\(quitWaitVisible) quitWaitCancelled=\(quitWaitCancelled) thumbnailCoalesced=\(coalesced) failedPreviewCollapsed=\(failedPreviewCollapsed) dotSelects=\(dotSelects) swipeSwitches=\(swipeSwitches) flush=\(flush) blankDiscarded=\(blankDiscarded) hiddenDeleted=\(hiddenDeleted) dropStacked=\(dropStacked) editorRoundTrip=\(editorRoundTrip) cleanup=\(store.notes.count == savedCount)")
+            print("SMOKE TEST: stacked=\(stacked) hidden=\(hidden) restored=\(restored) unstacked=\(unstacked) minimumLayout=\(minimumLayout) resizeGesture=\(resizeGesture) sharedPin=\(sharedPin) allRaised=\(allRaised) tabsAccessible=\(tabsAccessible) keyboardCycle=\(keyboardCycle) focusedControls=\(cardFocused && focusedControls) staysAfterClosingUI=\(staysAfterClosingUI) activeTabPreserved=\(activeTabPreserved) quitWaitVisible=\(quitWaitVisible) quitWaitCancelled=\(quitWaitCancelled) thumbnailCoalesced=\(coalesced) failedPreviewCollapsed=\(failedPreviewCollapsed) dotSelects=\(dotSelects) swipeSwitches=\(swipeSwitches) flush=\(flush) blankDiscarded=\(blankDiscarded) hiddenDeleted=\(hiddenDeleted) dropStacked=\(dropStacked) swipeAddsNote=\(blankPageDiscarded) sideNotes=\(sideNotes) snooze=\(snooze) editorRoundTrip=\(editorRoundTrip) cleanup=\(store.notes.count == savedCount)")
             fflush(stdout)
-            precondition(stacked && hidden && restored && unstacked && minimumLayout && resizeGesture && sharedPin && allRaised && tabsAccessible && keyboardCycle && cardFocused && focusedControls && staysAfterClosingUI && activeTabPreserved && quitWaitVisible && quitWaitCancelled && coalesced && failedPreviewCollapsed && dotSelects && swipeSwitches && flush && blankDiscarded && hiddenDeleted && dropStacked && editorRoundTrip && store.notes.count == savedCount, "Desktop note regression failed")
+            precondition(stacked && hidden && restored && unstacked && minimumLayout && resizeGesture && sharedPin && allRaised && tabsAccessible && keyboardCycle && cardFocused && focusedControls && staysAfterClosingUI && activeTabPreserved && quitWaitVisible && quitWaitCancelled && coalesced && failedPreviewCollapsed && dotSelects && swipeSwitches && flush && blankDiscarded && hiddenDeleted && dropStacked && blankPageDiscarded && sideNotes && snooze && editorRoundTrip && store.notes.count == savedCount, "Desktop note regression failed")
             DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { NSApp.terminate(nil) }
+            } } }
         }
         var loaded: [NSImage?] = []
         func thumbnailLoaded(_ image: NSImage?) {

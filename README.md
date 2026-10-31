@@ -20,4 +20,8 @@ macOS 13+ with Swift command-line tools. Quit the running app, then:
 
 ⌃⌥N creates a note · ⌘W hides it · ⌘Z / ⌘⇧Z undo / redo. Undo survives hiding and stacking until you quit the app.
 
+- **Stacks:** notes can overlap freely. Drag one by its top strip until it sits almost exactly on another; it wiggles to show it will stack. Let go to stack, or keep dragging to cancel. Swipe between notes in a stack; swipe past the last one to start a new note.
+- **Side notes:** push a note against the left or right edge of the screen. It tucks away as a thin tab and slides out when you hover over the tab. Drag it away from the edge to put it back on the desktop.
+- **Snooze:** the moon button next to Copy hides a note until a chosen time, then brings it back in front of your windows. Defaults: next morning (9 AM), evening (9 PM), in 12 hours, next week (Monday 9 AM). Choose the times in Settings.
+
 Tests: `./scripts/test.sh` and `./scripts/test-install.sh`.

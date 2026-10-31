@@ -44,6 +44,7 @@ final class NoteStore {
         guard let index = notes.firstIndex(where: { $0.id == id }) else { return }
         body(&notes[index])
         notes[index].modified = Date()
+        if !notes[index].hidden { notes[index].snoozedUntil = nil }
         let removed = notes[index].hidden && notes[index].isBlank
         if removed { remove(id) }
         save()
@@ -55,6 +56,8 @@ final class NoteStore {
         var changed = false
         for index in notes.indices where selected.contains(notes[index].id) {
             body(&notes[index]); notes[index].modified = now; changed = true
+            // A note shown by any route is no longer snoozed.
+            if !notes[index].hidden { notes[index].snoozedUntil = nil }
         }
         guard changed else { return }
         let removed = discardBlankHidden(selected)
@@ -83,6 +86,20 @@ final class NoteStore {
         onChange?()
         return note
     }
+    /// Adds a fully configured note without notifying; the caller synchronizes the desktop.
+    func insert(_ note: StickyNote) {
+        guard !loadFailed else { return }
+        notes.append(note)
+        save()
+    }
+    /// Hidden notes whose snooze has ended return to the desktop. Returns the woken notes.
+    @discardableResult func wakeSnoozed(at now: Date = Date()) -> [UUID] {
+        let due = notes.filter { $0.hidden && ($0.snoozedUntil.map { $0 <= now } ?? false) }.map(\.id)
+        if !due.isEmpty { updateMany(due) { $0.hidden = false } }
+        return due
+    }
+    /// The earliest pending snooze among hidden notes.
+    var nextSnoozeWake: Date? { notes.compactMap { $0.hidden ? $0.snoozedUntil : nil }.min() }
     func undoManager(for id: UUID) -> UndoManager? { histories[id]?.manager }
     func history(for id: UUID) -> NoteHistory {
         if let history = histories[id] { return history }

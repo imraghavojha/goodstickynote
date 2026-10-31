@@ -31,6 +31,18 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
     private var failedPreviewIDs = Set<UUID>()
     private var importsInProgress = 0
     private weak var stackTarget: WidgetController?
+    private var stackArmed = false
+    private(set) var dockArmed: DockEdge?
+    private var dragMoved = false
+    private var levelBeforeDrag: NSWindow.Level?
+    /// A side note tucked into its screen edge: the note window is ordered out and only
+    /// its tab shows. The tab exists only for docked notes.
+    private(set) var collapsed = false
+    private(set) var tab: DockTab?
+    private var collapseWork: Timer?
+    /// Mouse-moved monitors, installed only while a side note is slid out.
+    private var hoverMonitors: [Any] = []
+    private var menuOpen = false
     private var moving = false
     private var configuring = false
     private var layingOut = false
@@ -58,23 +70,26 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
             let visible = (NSScreen.screens.first { $0.visibleFrame.intersects(saved) } ?? NSScreen.main)?.visibleFrame ?? saved
             let width = min(saved.width, visible.width), height = min(saved.height, visible.height)
             panel.setFrame(NSRect(x: min(max(saved.minX, visible.minX), visible.maxX - width), y: min(max(saved.minY, visible.minY), visible.maxY - height), width: width, height: height), display: false)
+            if note.dockEdge != nil, let docked = dockedFrame() { panel.setFrame(docked, display: false); collapsed = true }
         }
         configuring = false
         refresh()
     }
     required init?(coder: NSCoder) { fatalError() }
     func setup() {
-        surface.addSubview(handle); handle.toolTip = "Drag to move · drop on another note to stack"
-        handle.onMove = { [weak self] point in self?.moving = true; self?.trackStackTarget(at: point) }
+        surface.addSubview(handle); handle.toolTip = "Drag to move · drop squarely on another note to stack · push against a screen edge for a side note"
+        handle.onBegin = { [weak self] in self?.beginMove() }
+        handle.onMove = { [weak self] point in self?.moving = true; self?.trackDrag(at: point) }
         handle.onRelease = { [weak self] point in
             // A drag saves its final position once, not on every mouse event.
             self?.moving = false; self?.saveFrame(); self?.finishMove(at: point)
         }
         display.onActivate = { [weak self] event in self?.activate(with: event) }
         display.onScroll = { [weak self] events in self?.scrollIdle(events) }
-        display.canSwipe = { [weak self] in (self?.ids.count ?? 0) > 1 }
-        display.swipe.onSwipe = { [weak self] direction in self?.cycle(direction) }
-        surface.onSwipe = { [weak self] direction in self?.cycle(direction) }
+        // Every note swipes: past the last note, a swipe starts a new one in the stack.
+        display.canSwipe = { true }
+        display.swipe.onSwipe = { [weak self] direction in self?.cycle(direction, extending: true) }
+        surface.onSwipe = { [weak self] direction in self?.cycle(direction, extending: true) }
         dots.onSelect = { [weak self] index in
             guard let self, self.ids.indices.contains(index) else { return }
             self.select(self.ids[index])
@@ -83,7 +98,7 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         surface.addSubview(attachments); surface.addSubview(dots); surface.addSubview(grip)
         surface.onHover = { [weak self] hovering in
             guard let self else { return }
-            self.hovering = hovering; self.updateControlsVisibility(); self.scheduleEndEditing()
+            self.hovering = hovering; self.updateControlsVisibility(); self.scheduleEndEditing(); self.checkHover()
         }
         surface.onDrop = { [weak self] in self?.addFiles($0) }
         surface.onLayout = { [weak self] in self?.layoutNote() }
@@ -117,8 +132,8 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
             textView.isContinuousSpellCheckingEnabled = false
             textView.onFiles = { [weak self] in self?.addFiles($0) }
             textView.onCycle = { [weak self] direction in self?.cycle(direction) }
-            scroll.canSwipe = { [weak self] in (self?.ids.count ?? 0) > 1 }
-            scroll.onSwipe = { [weak self] direction in self?.cycle(direction) }
+            scroll.canSwipe = { true }
+            scroll.onSwipe = { [weak self] direction in self?.cycle(direction, extending: true) }
             scroll.documentView = textView
             self.textView = textView; self.scroll = scroll
             loadEditor()
@@ -188,6 +203,7 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
                 self?.copyButton?.image = sharedSymbol("doc.on.doc")
             }
         }
+        let snooze = ActionButton("Snooze note", symbol: "moon.zzz") { [weak self] in self?.showSnoozeMenu() }
         let hide = ActionButton("Hide note", symbol: "minus") { [weak self] in
             guard let self else { return }; self.store.update(self.activeID) { $0.hidden = true }
         }
@@ -195,7 +211,7 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         let appearance = ActionButton("Appearance", symbol: "paintpalette") { [weak self] in self?.showAppearance() }
         let menu = ActionButton("Note options", symbol: "ellipsis") { [weak self] in self?.showMenu() }
         let stack = FrameStack(.horizontal); stack.isHidden = true
-        for button in [copy, hide, attach, appearance, menu] { stack.addArrangedSubview(button, length: 21) }
+        for button in [copy, snooze, hide, attach, appearance, menu] { stack.addArrangedSubview(button, length: Self.buttonWidth) }
         copyButton = copy; attachButton = attach; controls = stack
         surface.addSubview(stack)
         styleControls(); layoutNote()
@@ -209,6 +225,9 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
             attachButton.setAccessibilityLabel(attachButton.toolTip)
         }
     }
+    static let buttonWidth: CGFloat = 20
+    /// Leading edge of hover button `index` (0 = copy … 5 = options), in surface coordinates.
+    func buttonX(_ index: Int) -> CGFloat { surface.bounds.width - 124 + CGFloat(index) * Self.buttonWidth }
     func updateControlsVisibility() {
         let visible = hovering || window?.isKeyWindow == true || importsInProgress > 0
         if visible { ensureControls() }
@@ -227,10 +246,21 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         transition.subtype = (direction ?? (to > from ? 1 : -1)) > 0 ? .fromRight : .fromLeft
         transition.timingFunction = CAMediaTimingFunction(name: .easeOut)
         surface.layer?.add(transition, forKey: "switch")
+        let leaving = activeID
         activeID = id; refresh()
+        // A blank page left behind in a stack has nothing to keep.
+        if ids.count > 1, store.note(leaving)?.isBlank == true { store.delete(leaving) }
     }
-    func cycle(_ direction: Int) {
-        guard ids.count > 1, let index = ids.firstIndex(of: activeID) else { return }
+    /// Steps through the stack. A swipe (`extending`) past the last note adds a new one
+    /// instead of wrapping around; keyboard cycling still wraps.
+    func cycle(_ direction: Int, extending: Bool = false) {
+        guard let index = ids.firstIndex(of: activeID) else { return }
+        if extending && direction > 0 && index == ids.count - 1 {
+            // A blank last note is already a fresh page.
+            if note?.isBlank != true { AppDelegate.shared.appendNote(to: self) }
+            return
+        }
+        guard ids.count > 1 else { return }
         select(ids[(index + direction + ids.count) % ids.count], direction: direction)
     }
     func refreshDots() {
@@ -238,32 +268,235 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         dots.current = ids.firstIndex(of: activeID) ?? 0
         dots.titles = ids.map { store.note($0)?.title ?? "Untitled note" }
     }
-    /// The note directly beneath the cursor (under the one being dragged), as WindowServer
-    /// orders windows. A note covered by another app's window is never a target.
-    func stackCandidate(at point: NSPoint) -> WidgetController? {
-        guard let window else { return nil }
-        var number = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: 0)
-        if number == window.windowNumber { number = NSWindow.windowNumber(at: point, belowWindowWithWindowNumber: number) }
-        return AppDelegate.shared.widgets.values.first { $0 !== self && $0.window?.windowNumber == number && $0.window?.isVisible == true }
+    // MARK: Dragging: stacking and side notes
+
+    func beginMove() {
+        collapseWork?.invalidate(); collapseWork = nil
+        dragMoved = false
+        guard let window else { return }
+        // The dragged note rides above other notes and apps until it is dropped.
+        if window.level.rawValue < NSWindow.Level.floating.rawValue { levelBeforeDrag = window.level; window.level = .floating }
+        window.orderFrontRegardless()
     }
-    private var lastProbe = (point: NSPoint(x: -1e6, y: -1e6), time: 0.0)
-    func trackStackTarget(at point: NSPoint) {
-        // Hit-testing asks WindowServer; during a drag, probe again only after a real move.
-        let now = ProcessInfo.processInfo.systemUptime
-        guard hypot(point.x - lastProbe.point.x, point.y - lastProbe.point.y) >= 6 || now - lastProbe.time >= 0.05 else { return }
-        lastProbe = (point, now)
-        let candidate = stackCandidate(at: point)
-        guard candidate !== stackTarget else { return }
-        stackTarget?.surface.stackTarget = false
-        candidate?.surface.stackTarget = true
-        stackTarget = candidate
+    /// Notes overlap freely; only a note dropped almost exactly on top of another stacks.
+    /// Once armed the dragged note wiggles and shrinks slightly, and moving away disarms it.
+    func trackDrag(at point: NSPoint) {
+        guard let frame = window?.frame else { return }
+        dragMoved = true
+        let target = stackCandidate(for: frame)
+        if target !== stackTarget {
+            stackTarget?.surface.stackTarget = false
+            target?.surface.stackTarget = true
+            stackTarget = target
+            setStackArmed(target != nil)
+        }
+        let edge = target == nil ? dockEdge(at: point, frame: frame) : nil
+        if edge != dockArmed { dockArmed = edge; window?.alphaValue = edge == nil ? 1 : 0.6 }
+    }
+    /// Whether a note at `moving` covers `target` closely enough to stack onto it.
+    static func covers(_ moving: NSRect, _ target: NSRect, armed: Bool) -> Bool {
+        let overlap = moving.intersection(target)
+        let smaller = min(moving.width * moving.height, target.width * target.height)
+        guard !overlap.isNull, smaller > 0 else { return false }
+        let coverage = overlap.width * overlap.height / smaller
+        let distance = hypot(moving.midX - target.midX, moving.midY - target.midY)
+        let reach = max(24, min(moving.width, moving.height, target.width, target.height) * 0.25)
+        // Once armed, some slack keeps the target from flickering at the boundary.
+        return armed ? coverage >= 0.7 && distance <= reach * 1.5 : coverage >= 0.82 && distance <= reach
+    }
+    func stackCandidate(for frame: NSRect) -> WidgetController? {
+        var best: (widget: WidgetController, distance: CGFloat)?
+        for widget in AppDelegate.shared.widgets.values where widget !== self && !widget.collapsed && widget.window?.isVisible == true {
+            guard let other = widget.window?.frame, Self.covers(frame, other, armed: widget === stackTarget) else { continue }
+            let distance = hypot(frame.midX - other.midX, frame.midY - other.midY)
+            if best.map({ distance < $0.distance }) ?? true { best = (widget, distance) }
+        }
+        guard let candidate = best?.widget else { return nil }
+        if candidate === stackTarget { return candidate }
+        // A note hidden behind another app's window is never a target. WindowServer is
+        // asked only when a new candidate first qualifies.
+        guard let window, let other = candidate.window else { return nil }
+        let below = NSWindow.windowNumber(at: NSPoint(x: other.frame.midX, y: other.frame.midY), belowWindowWithWindowNumber: window.windowNumber)
+        return below == other.windowNumber ? candidate : nil
+    }
+    /// Transform about the layer's center, whatever anchor AppKit gave the backing layer.
+    private func centered(angle: CGFloat = 0, scale: CGFloat = 1, shiftX: CGFloat = 0) -> CATransform3D {
+        guard let layer = surface.layer else { return CATransform3DIdentity }
+        let cx = layer.bounds.width * (0.5 - layer.anchorPoint.x), cy = layer.bounds.height * (0.5 - layer.anchorPoint.y)
+        var transform = CATransform3DMakeTranslation(cx + shiftX, cy, 0)
+        transform = CATransform3DRotate(transform, angle, 0, 0, 1)
+        transform = CATransform3DScale(transform, scale, scale, 1)
+        return CATransform3DTranslate(transform, -cx, -cy, 0)
+    }
+    /// Render-server animations only: no per-frame work in the app.
+    private func setStackArmed(_ armed: Bool) {
+        guard armed != stackArmed, let layer = surface.layer else { return }
+        stackArmed = armed
+        if armed {
+            let wiggle = CAKeyframeAnimation(keyPath: "transform")
+            wiggle.values = [(0.0, 1.0), (-0.035, 0.94), (0.03, 0.94), (-0.018, 0.94), (0.008, 0.94), (0, 0.94)].map { NSValue(caTransform3D: centered(angle: $0.0, scale: $0.1)) }
+            wiggle.duration = 0.42; wiggle.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            wiggle.fillMode = .forwards; wiggle.isRemovedOnCompletion = false
+            layer.add(wiggle, forKey: "stackArm")
+        } else {
+            let current = layer.presentation()?.transform ?? CATransform3DIdentity
+            let settle = CABasicAnimation(keyPath: "transform")
+            settle.fromValue = NSValue(caTransform3D: current); settle.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+            settle.duration = 0.16; settle.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            layer.add(settle, forKey: "stackArm")
+        }
+    }
+    /// The outer screen edge the cursor (or most of the note) has been pushed against.
+    func dockEdge(at mouse: NSPoint, frame: NSRect) -> DockEdge? {
+        let screens = NSScreen.screens
+        guard let screen = screens.first(where: { NSMouseInRect(mouse, $0.frame, false) }) ?? window?.screen else { return nil }
+        let bounds = screen.frame, overhang = frame.width * 0.35
+        // An edge shared with another display is a way through, not a place to dock.
+        func outer(_ x: CGFloat) -> Bool { !screens.contains { $0 !== screen && NSMouseInRect(NSPoint(x: x, y: mouse.y), $0.frame, false) } }
+        if (mouse.x <= bounds.minX + 4 || frame.minX < bounds.minX - overhang) && outer(bounds.minX - 2) { return .left }
+        if (mouse.x >= bounds.maxX - 5 || frame.maxX > bounds.maxX + overhang) && outer(bounds.maxX + 2) { return .right }
+        return nil
     }
     func finishMove(at point: NSPoint) {
-        let target = stackCandidate(at: point)
+        let target = stackTarget, edge = dockArmed, moved = dragMoved
         stackTarget?.surface.stackTarget = false; stackTarget = nil
-        guard let target else { return }
-        AppDelegate.shared.stack(activeID, with: target.activeID)
+        dockArmed = nil; dragMoved = false; window?.alphaValue = 1
+        if let level = levelBeforeDrag { levelBeforeDrag = nil; window?.level = level }
+        if let target {
+            stackArmed = false; surface.layer?.removeAnimation(forKey: "stackArm")
+            AppDelegate.shared.stack(activeID, with: target.activeID)
+            return
+        }
+        setStackArmed(false)
+        guard moved else { return }
+        if let edge { dock(to: edge, at: point) }
+        else if note?.dockEdge != nil { undock() }
     }
+
+    // MARK: Side notes
+
+    /// The slid-out frame of a side note: flush with its screen edge.
+    func dockedFrame() -> NSRect? {
+        guard let note, let edge = note.dockEdge else { return nil }
+        let center = NSPoint(x: note.x + note.width / 2, y: note.y + note.height / 2)
+        guard let visible = (NSScreen.screens.first { NSMouseInRect(center, $0.frame, false) } ?? NSScreen.main)?.visibleFrame else { return nil }
+        let width = min(max(140, note.width), visible.width), height = min(max(96, note.height), visible.height)
+        return NSRect(x: edge == .left ? visible.minX : visible.maxX - width, y: min(max(note.y, visible.minY), visible.maxY - height), width: width, height: height)
+    }
+    func dock(to edge: DockEdge, at point: NSPoint) {
+        guard let window else { return }
+        let screen = NSScreen.screens.first { NSMouseInRect(point, $0.frame, false) } ?? window.screen ?? NSScreen.main
+        guard let visible = screen?.visibleFrame else { return }
+        let frame = window.frame
+        let width = min(frame.width, visible.width), height = min(frame.height, visible.height)
+        let docked = NSRect(x: edge == .left ? visible.minX : visible.maxX - width, y: min(max(frame.minY, visible.minY), visible.maxY - height), width: width, height: height)
+        store.updateMany(ids, notify: false) { $0.dock = edge.rawValue; $0.x = docked.minX; $0.y = docked.minY; $0.width = width; $0.height = height }
+        configuring = true; window.setFrame(docked, display: true); configuring = false
+        refresh()
+        collapse()
+    }
+    func undock() {
+        store.updateMany(ids, notify: false) { $0.dock = nil }
+        leaveDock()
+        if window?.isKeyWindow != true && !groupRaised && !transientFront { setLevel() }
+    }
+    /// Drops side-note state once the note is no longer docked.
+    private func leaveDock() {
+        stopHoverTracking()
+        tab?.close(); tab = nil
+        surface.layer?.removeAnimation(forKey: "dock")
+        if collapsed { collapsed = false; window?.orderFrontRegardless() }
+    }
+    /// Slides the note into its edge, leaving only the tab.
+    func collapse() {
+        guard let edge = note?.dockEdge, !collapsed, let window, let layer = surface.layer else { return }
+        collapsed = true
+        stopHoverTracking()
+        appearancePopover?.close()
+        hovering = false; updateControlsVisibility()
+        let slide = CABasicAnimation(keyPath: "transform")
+        slide.fromValue = NSValue(caTransform3D: CATransform3DIdentity)
+        slide.toValue = NSValue(caTransform3D: centered(shiftX: (edge == .left ? -1 : 1) * window.frame.width))
+        slide.duration = 0.16; slide.timingFunction = CAMediaTimingFunction(name: .easeIn)
+        slide.fillMode = .forwards; slide.isRemovedOnCompletion = false
+        layer.add(slide, forKey: "dock")
+        // Ordered out once the slide ends, unless the note was reopened meanwhile.
+        Self.after(slide.duration) { [weak self] in
+            guard let self, self.collapsed else { return }
+            window.orderOut(nil)
+            layer.removeAnimation(forKey: "dock")
+            self.showTab()
+        }
+    }
+    /// Slides a side note out of its edge. Hovering opens it; clicking also focuses it.
+    func expand(focus: Bool = false) {
+        guard let edge = note?.dockEdge, let window else { return }
+        if collapsed, let frame = dockedFrame() {
+            collapsed = false
+            tab?.orderOut(nil)
+            configuring = true; window.setFrame(frame, display: false); configuring = false
+            window.level = .floating
+            window.orderFrontRegardless()
+            let slide = CABasicAnimation(keyPath: "transform")
+            slide.fromValue = NSValue(caTransform3D: centered(shiftX: (edge == .left ? -1 : 1) * frame.width))
+            slide.toValue = NSValue(caTransform3D: CATransform3DIdentity)
+            slide.duration = 0.2; slide.timingFunction = CAMediaTimingFunction(name: .easeOut)
+            surface.layer?.add(slide, forKey: "dock")
+            hovering = frame.contains(NSEvent.mouseLocation); updateControlsVisibility()
+        }
+        startHoverTracking()
+        if focus { window.makeKeyAndOrderFront(nil); window.makeFirstResponder(beginEditing()) }
+        else { checkHover() }
+    }
+    private func showTab() {
+        guard let note, let edge = note.dockEdge, let frame = dockedFrame() else { return }
+        let tab = self.tab ?? {
+            let tab = DockTab()
+            tab.tabView.onOpen = { [weak self] click in self?.expand(focus: click) }
+            self.tab = tab
+            return tab
+        }()
+        tab.tabView.edge = edge; tab.tabView.paper = note.theme.paper.withAlphaComponent(max(0.6, note.opacity)); tab.tabView.ink = note.theme.ink
+        tab.tabView.setAccessibilityLabel("Show side note: " + note.title)
+        tab.tabView.toolTip = note.title
+        let size = DockTab.size
+        tab.setFrame(NSRect(x: edge == .left ? frame.minX : frame.maxX - size.width, y: frame.midY - size.height / 2, width: size.width, height: size.height), display: false)
+        tab.orderFrontRegardless()
+    }
+    /// Displays changed: keep tabs on their (possibly moved) edges.
+    func screensChanged() { if collapsed { showTab() } }
+    private func startHoverTracking() {
+        guard hoverMonitors.isEmpty else { return }
+        if let global = NSEvent.addGlobalMonitorForEvents(matching: .mouseMoved, handler: { [weak self] _ in self?.checkHover() }) { hoverMonitors.append(global) }
+        if let local = NSEvent.addLocalMonitorForEvents(matching: .mouseMoved, handler: { [weak self] event in self?.checkHover(); return event }) { hoverMonitors.append(local) }
+    }
+    private func stopHoverTracking() {
+        hoverMonitors.forEach(NSEvent.removeMonitor); hoverMonitors.removeAll()
+        collapseWork?.invalidate(); collapseWork = nil
+    }
+    /// A slid-out side note stays open while it is used.
+    private var holdsOpen: Bool {
+        window?.isKeyWindow == true || moving || menuOpen || appearancePopover?.isShown == true || window?.attachedSheet != nil || importsInProgress > 0
+    }
+    private var mouseInside: Bool { window?.frame.insetBy(dx: -6, dy: -6).contains(NSEvent.mouseLocation) == true }
+    /// Tucks a slid-out side note away shortly after the pointer leaves it.
+    func checkHover() {
+        guard note?.dockEdge != nil, !collapsed, window?.isVisible == true else { return }
+        if mouseInside || holdsOpen { collapseWork?.invalidate(); collapseWork = nil; return }
+        guard collapseWork == nil else { return }
+        collapseWork = Self.after(0.45) { [weak self] in
+            guard let self else { return }
+            self.collapseWork = nil
+            if !self.mouseInside && !self.holdsOpen { self.collapse() }
+        }
+    }
+    /// A one-shot run-loop timer (also fires inside nested run loops, unlike main-queue work).
+    @discardableResult static func after(_ delay: TimeInterval, _ body: @escaping () -> Void) -> Timer {
+        let timer = Timer(timeInterval: delay, repeats: false) { _ in body() }
+        RunLoop.main.add(timer, forMode: .common)
+        return timer
+    }
+
     func refresh(using supplied: StickyNote? = nil) {
         guard let note = supplied ?? self.note, note != lastRenderedNote else { return }
         lastRenderedNote = note; configuring = true
@@ -277,7 +510,9 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         if dots.tint != note.theme.ink { dots.tint = note.theme.ink }
         styleControls()
         refreshDots()
-        if note.pinned { window?.level = .floating }
+        if note.dockEdge == nil, collapsed || tab != nil { leaveDock() }
+        if collapsed { showTab() }
+        if note.pinned || note.dockEdge != nil { window?.level = .floating }
         else if !transientFront && !groupRaised && window?.isKeyWindow != true && appearancePopover?.isShown != true && window?.attachedSheet == nil { setLevel() }
         failedPreviewIDs.formIntersection(Set(note.attachments.map(\.id)))
         configuring = false; layoutNote()
@@ -287,8 +522,8 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         layingOut = true; defer { layingOut = false }
         let width = surface.bounds.width, height = surface.bounds.height
         guard width > 0, height > 0 else { return }
-        handle.frame = NSRect(x: 0, y: height - 27, width: max(24, width - 112), height: 27)
-        controls?.frame = NSRect(x: width - 111, y: height - 25, width: 105, height: 22)
+        handle.frame = NSRect(x: 0, y: height - 27, width: max(24, width - 126), height: 27)
+        controls?.frame = NSRect(x: buttonX(0), y: height - 25, width: Self.buttonWidth * 6, height: 22)
         grip.frame = NSRect(x: width - 17, y: 0, width: 17, height: 17)
         let stacked = ids.count > 1
         var bottom: CGFloat = 9
@@ -313,23 +548,31 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         display.frame = NSRect(x: 10, y: bottom, width: max(0, width - 20), height: max(20, height - 28 - bottom))
         scroll?.frame = display.frame
     }
-    override func close() { importSpinner?.stopAnimation(nil); appearancePopover?.close(); endEditingWork?.cancel(); super.close() }
+    override func close() {
+        importSpinner?.stopAnimation(nil); appearancePopover?.close(); endEditingWork?.cancel()
+        stopHoverTracking(); tab?.close(); tab = nil
+        super.close()
+    }
     func updateMembers(_ members: [UUID]) {
         let sameEditor = members.contains(activeID)
         ids = members
         if !sameEditor { activeID = members[0]; lastRenderedNote = nil }
         refreshDots()
         if let note, let frame = window?.frame {
-            let desired = NSRect(x: note.x, y: note.y, width: note.width, height: note.height)
+            let desired = dockedFrame() ?? NSRect(x: note.x, y: note.y, width: note.width, height: note.height)
             if frame != desired { configuring = true; window?.setFrame(desired, display: true); configuring = false }
         }
         refresh(); layoutNote()
     }
     func setLevel() {
         guard let note else { return }
-        window?.level = note.pinned ? .floating : NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
+        window?.level = note.pinned || note.dockEdge != nil ? .floating : NSWindow.Level(rawValue: Int(CGWindowLevelForKey(.desktopIconWindow)) + 1)
     }
     func show(focus: Bool = false) {
+        if note?.dockEdge != nil {
+            if focus { expand(focus: true) } else if collapsed { showTab() } else { window?.orderFrontRegardless() }
+            return
+        }
         if window?.isVisible != true { fade(in: true) }
         if focus {
             transientFront = true; window?.level = .floating
@@ -362,18 +605,18 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
             surface.layer?.removeAnimation(forKey: "visibility")
         }
     }
-    func bringForward() { groupRaised = true; transientFront = false; window?.level = .floating; window?.orderFrontRegardless() }
+    func bringForward() { guard !collapsed else { return }; groupRaised = true; transientFront = false; window?.level = .floating; window?.orderFrontRegardless() }
     func returnToDesktop() { groupRaised = false; transientFront = false; setLevel() }
     func windowDidResignKey(_ notification: Notification) {
         transientFront = false; if !groupRaised && appearancePopover?.isShown != true && window?.attachedSheet == nil { setLevel() }
-        setEditingServices(false); updateControlsVisibility(); scheduleEndEditing()
+        setEditingServices(false); updateControlsVisibility(); scheduleEndEditing(); checkHover()
         if AppDelegate.shared.library?.window?.isVisible == true { AppDelegate.shared.library?.refresh() }
     }
     func windowDidBecomeKey(_ notification: Notification) { endEditingWork?.cancel(); setEditingServices(true); updateControlsVisibility() }
     func windowDidMove(_ notification: Notification) { if !moving { saveFrame() } }
     func windowDidResize(_ notification: Notification) { layoutNote(); saveFrame() }
     func saveFrame() {
-        guard !configuring, let frame = window?.frame, let note else { return }
+        guard !configuring, !collapsed, let frame = window?.frame, let note else { return }
         guard note.x != frame.minX || note.y != frame.minY || note.width != frame.width || note.height != frame.height else { return }
         store.updateMany(ids, notify: false) { $0.x = frame.minX; $0.y = frame.minY; $0.width = frame.width; $0.height = frame.height }
     }
@@ -410,7 +653,7 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
                 }
                 self.styleControls()
                 self.hovering = self.surface.bounds.contains(self.surface.convert(self.window?.mouseLocationOutsideOfEventStream ?? .zero, from: nil))
-                self.updateControlsVisibility()
+                self.updateControlsVisibility(); self.checkHover()
             }
         }
     }
@@ -426,7 +669,7 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         }
         menu.addItem(.separator())
         menu.addItem(ClosureMenuItem("Add files…") { [weak self] in self?.chooseFiles() })
-        menu.popUp(positioning: nil, at: NSPoint(x: surface.bounds.width - 60, y: surface.bounds.height - 24), in: surface)
+        popUp(menu, at: buttonX(3))
     }
     func chooseFiles() {
         let picker = NSOpenPanel(); picker.allowsMultipleSelection = true; picker.canChooseDirectories = false; picker.prompt = "Attach"
@@ -465,28 +708,43 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         let controller = NoteAppearanceController(noteID: activeID)
         let popover = NSPopover(); popover.delegate = self; popover.behavior = .transient; popover.contentViewController = controller
         appearancePopover = popover
-        popover.show(relativeTo: NSRect(x: surface.bounds.width - 48, y: surface.bounds.height - 26, width: 20, height: 20), of: surface, preferredEdge: .maxY)
+        popover.show(relativeTo: NSRect(x: buttonX(4), y: surface.bounds.height - 26, width: Self.buttonWidth, height: 20), of: surface, preferredEdge: .maxY)
     }
-    func popoverDidClose(_ notification: Notification) { if window?.isKeyWindow != true && !groupRaised { setLevel() }; appearancePopover = nil }
+    func popoverDidClose(_ notification: Notification) { if window?.isKeyWindow != true && !groupRaised { setLevel() }; appearancePopover = nil; checkHover() }
+    /// Menus run their own tracking loop; a side note stays open until one closes.
+    private func popUp(_ menu: NSMenu, at x: CGFloat) {
+        menuOpen = true
+        menu.popUp(positioning: nil, at: NSPoint(x: x, y: surface.bounds.height - 26), in: surface)
+        menuOpen = false; checkHover()
+    }
+    private static let snoozeFormatter: DateFormatter = { let f = DateFormatter(); f.setLocalizedDateFormatFromTemplate("EEEjmm"); return f }()
+    func showSnoozeMenu() {
+        let menu = NSMenu()
+        let now = Date(), options = store.preferences.snoozeOptions
+        // Soonest first, whatever the time of day.
+        for (option, date) in options.map({ ($0, $0.date(from: now)) }).sorted(by: { $0.1 < $1.1 }) {
+            let title = option.title(from: now)
+            let item = ClosureMenuItem(title) { [weak self] in self?.snooze(until: date) }
+            let text = NSMutableAttributedString(string: title)
+            text.append(NSAttributedString(string: "   " + Self.snoozeFormatter.string(from: date), attributes: [.foregroundColor: NSColor.secondaryLabelColor, .font: NSFont.menuFont(ofSize: 0)]))
+            item.attributedTitle = text
+            menu.addItem(item)
+        }
+        if options.isEmpty { let none = NSMenuItem(title: "No snooze times chosen", action: nil, keyEquivalent: ""); none.isEnabled = false; menu.addItem(none) }
+        menu.addItem(.separator())
+        menu.addItem(ClosureMenuItem("Snooze Times…") { AppDelegate.shared.showPreferences() })
+        popUp(menu, at: buttonX(1))
+    }
+    /// Hides the visible note until `date`; it then returns to the desktop by itself.
+    func snooze(until date: Date) {
+        store.update(activeID) { $0.snoozedUntil = date; $0.hidden = true }
+    }
     func showMenu() {
         guard let note else { return }
         let menu = NSMenu()
         @discardableResult func item(_ title: String, _ action: @escaping () -> Void) -> NSMenuItem {
             let item = ClosureMenuItem(title, action: action); menu.addItem(item); return item
         }
-        item("Attach files…") { [weak self] in self?.chooseFiles() }
-        let themes = NSMenu()
-        for theme in NoteTheme.all {
-            let choice = ClosureMenuItem(theme.name) { [weak self] in guard let self else { return }; self.store.update(self.activeID) { $0.themeID = theme.id } }
-            choice.state = theme.id == note.themeID ? .on : .off; themes.addItem(choice)
-        }
-        let themeItem = NSMenuItem(title: "Paper color", action: nil, keyEquivalent: ""); themeItem.submenu = themes; menu.addItem(themeItem)
-        let opacityMenu = NSMenu()
-        for value in [1.0, 0.9, 0.8, 0.65, 0.5, 0.35] {
-            let choice = ClosureMenuItem("\(Int(value * 100))%") { [weak self] in guard let self else { return }; self.store.update(self.activeID) { $0.opacity = value } }
-            choice.state = abs(value - note.opacity) < 0.01 ? .on : .off; opacityMenu.addItem(choice)
-        }
-        let opacityItem = NSMenuItem(title: "Paper opacity", action: nil, keyEquivalent: ""); opacityItem.submenu = opacityMenu; menu.addItem(opacityItem)
         item(note.pinned ? "Keep on desktop" : "Keep above other apps") { [weak self] in guard let self else { return }; AppDelegate.shared.setPinned(self.activeID, pinned: !note.pinned) }
         menu.addItem(.separator())
         if ids.count > 1 {
@@ -509,15 +767,10 @@ final class WidgetController: NSWindowController, NSWindowDelegate, NSTextViewDe
         if stackMenu.items.count > 0 {
             let stackItem = NSMenuItem(title: "Stack with…", action: nil, keyEquivalent: ""); stackItem.submenu = stackMenu; menu.addItem(stackItem)
         }
-        if !note.attachments.isEmpty {
-            let files = NSMenu()
-            for attachment in note.attachments { files.addItem(ClosureMenuItem(attachment.name) { NSWorkspace.shared.open(self.store.attachmentURL(attachment)) }) }
-            let filesItem = NSMenuItem(title: "All attachments (\(note.attachments.count))", action: nil, keyEquivalent: ""); filesItem.submenu = files; menu.addItem(filesItem)
-        }
         item("All notes…") { AppDelegate.shared.showLibrary() }
         menu.addItem(.separator())
         item(note.isBlank ? "Delete note" : "Delete note…") { [weak self] in guard let self else { return }; AppDelegate.shared.confirmDelete(self.activeID) }
-        menu.popUp(positioning: nil, at: NSPoint(x: surface.bounds.width - 30, y: surface.bounds.height - 40), in: surface)
+        popUp(menu, at: buttonX(5))
     }
 }
 
