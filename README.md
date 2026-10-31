@@ -47,6 +47,9 @@ There is no idle polling or animation loop. Writes happen after changes; file co
 
 ## Verification
 
+For reproducible launch, footprint and settled CPU measurements, run
+`./scripts/bench.sh dist/GoodSticky.app 10`. See [benchmark methodology and verified results](docs/benchmarks/README.md).
+
 ```sh
 ./scripts/test.sh
 ./scripts/test-install.sh
