@@ -12,7 +12,9 @@ extension AppDelegate {
         }
     }
     func runSmokeTest() {
-        checkUndoHistory()
+        checkUndoHistory { [self] in runSmokeScenarios() }
+    }
+    private func runSmokeScenarios() {
         let savedCount = store.notes.count
         func capture(_ view: NSView?, _ name: String) {
             guard let index = CommandLine.arguments.firstIndex(of: "--snapshot-dir"), CommandLine.arguments.count > index + 1, let view else { return }

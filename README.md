@@ -6,7 +6,7 @@
 
 <p align="center">Native, lightweight sticky notes for macOS.<br>Made for personal use because Apple Stickies sucks.</p>
 
-<p align="center"><img src="assets/demo.gif" width="720" alt="Type, undo, drag notes into a stack, and switch between them."></p>
+<p align="center"><img src="assets/demo.gif" width="720" alt="Type and undo, stack notes with wiggle feedback, swipe to a new note, tuck a side note into the screen edge and hover to reveal it, then snooze a reminder until it returns."></p>
 
 <p align="center"><img src="assets/comparison.svg" width="720" alt="GoodSticky: 18 MB, 0.14 s launch CPU. Apple Stickies: 32 MB, 0.34 s launch CPU."></p>
 
