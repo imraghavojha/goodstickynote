@@ -1,0 +1,24 @@
+name: Native macOS checks
+on:
+  push:
+  pull_request:
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Model and persistence checks
+        run: ./scripts/test.sh
+      - name: Build native app
+        run: ./scripts/build.sh
+      - name: Atomic installer checks
+        run: ./scripts/test-install.sh
+      - name: AppKit widget lifecycle smoke test
+        run: dist/GoodSticky.app/Contents/MacOS/GoodSticky --smoke-test
+      - name: Archive app with executable permissions
+        run: ditto -c -k --sequesterRsrc --keepParent dist/GoodSticky.app dist/GoodSticky-macOS.zip
+      - name: Upload local app build
+        uses: actions/upload-artifact@v4
+        with:
+          name: GoodSticky-macOS
+          path: dist/GoodSticky-macOS.zip
